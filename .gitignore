@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+mcp_servers.json
+.venv/
+venv/
+*.wav
