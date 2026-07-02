@@ -1,10 +1,14 @@
-/* NIM Audio Client frontend.
+/* Voice Client frontend.
  *
  * Mic audio -> AudioWorklet (16 kHz Int16 chunks) -> energy VAD here ->
  * WebSocket binary frames to the server. Assistant TTS comes back as raw
  * PCM16 binary frames scheduled into an AudioContext. Speaking while audio
  * is playing (or the model is thinking) triggers barge-in: playback stops
  * instantly and the server cancels LLM + TTS generation.
+ *
+ * Multi-agent UI: @agent mentions in the text field switch the active agent
+ * (voice always talks to the active one); sub-agents spawned by the manager
+ * stream into collapsible cards inside the chat.
  */
 "use strict";
 
@@ -31,7 +35,12 @@ let playCtx = null, nextPlayTime = 0;
 const activeSources = new Set();
 
 let currentAssistantEl = null;    // streaming bubble
+let currentAgent = "assistant";   // active agent
+let streamingAgent = "assistant"; // agent of the bubble being streamed
+let agents = [];                  // [{name, description, access}]
+let lastVoice = "";               // TTS voice string for the header line
 const toolCards = new Map();      // tool_call id -> element
+const subCards = new Map();       // subagent id -> {card, textEl, body, calls: Map}
 
 // ---------------------------------------------------------------------------
 // DOM
@@ -41,6 +50,29 @@ const chatEl = $("chat"), chatWrap = $("chat-wrap");
 const statusPill = $("status-pill"), connDot = $("conn-dot"), modelInfo = $("model-info");
 const micBtn = $("mic-btn"), vadFill = $("vad-fill");
 const textInput = $("text-input"), sendBtn = $("send-btn"), resetBtn = $("reset-btn");
+const agentChip = $("active-agent"), agentList = $("agent-list");
+const initiatorStatus = $("initiator-status"), todoList = $("todo-list");
+const mentionPop = $("mention-pop");
+const themeBtn = $("theme-btn");
+const convBtn = $("conv-btn"), convPanel = $("conv-panel");
+const convName = $("conv-name"), convSaveBtn = $("conv-save-btn"), convList = $("conv-list");
+const modelEditBtn = $("model-edit-btn"), modelInput = $("model-input");
+
+// ---------------------------------------------------------------------------
+// Theme (light / dark)
+// ---------------------------------------------------------------------------
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  themeBtn.textContent = theme === "light" ? "🌙" : "☀️";
+  themeBtn.title = theme === "light" ? "Switch to dark mode" : "Switch to light mode";
+  try { localStorage.setItem("voice-client-theme", theme); } catch { /* private mode */ }
+}
+themeBtn.addEventListener("click", () =>
+  applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light"));
+applyTheme((() => {
+  try { return localStorage.getItem("voice-client-theme") || "dark"; }
+  catch { return "dark"; }
+})());
 
 // ---------------------------------------------------------------------------
 // WebSocket
@@ -70,17 +102,23 @@ function handleServerEvent(msg) {
   switch (msg.type) {
     case "config":
       ttsSampleRate = msg.tts_sample_rate;
-      modelInfo.textContent = `${msg.model} · ${msg.voice}` +
-        (msg.speech_enabled ? "" : " · ⚠ speech not configured");
+      lastVoice = msg.voice;
+      updateModelInfo(msg.model, msg.speech_enabled);
+      if (msg.agents) { agents = msg.agents; renderAgents(); }
+      setActiveAgent(msg.agent || "assistant", false);
       break;
     case "state":
       setState(msg.state);
+      break;
+    case "agent_changed":
+      setActiveAgent(msg.agent, true);
       break;
     case "transcript":
       addUserMessage(msg.text);
       break;
     case "assistant_start":
       currentAssistantEl = null; // created lazily on first delta
+      streamingAgent = msg.agent || currentAgent;
       break;
     case "assistant_delta":
       appendAssistantText(msg.text);
@@ -91,6 +129,7 @@ function handleServerEvent(msg) {
     case "interrupted":
       stopPlayback();
       finalizeAssistant(true);
+      interruptSubCards();
       break;
     case "tool_call":
       addToolCard(msg);
@@ -98,10 +137,45 @@ function handleServerEvent(msg) {
     case "tool_result":
       completeToolCard(msg);
       break;
+    case "subagent_start":
+      addSubCard(msg);
+      break;
+    case "subagent_delta":
+      appendSubText(msg);
+      break;
+    case "subagent_tool_call":
+      addSubToolCall(msg);
+      break;
+    case "subagent_tool_result":
+      completeSubToolCall(msg);
+      break;
+    case "subagent_done":
+      finishSubCard(msg);
+      break;
+    case "todos":
+      renderTodos(msg.todos);
+      break;
+    case "saved":
+      addNotice(`Conversation saved as “${msg.name}”.`);
+      refreshConversations();
+      break;
+    case "loaded":
+      chatEl.innerHTML = "";
+      toolCards.clear();
+      subCards.clear();
+      currentAssistantEl = null;
+      replayTranscript(msg.transcript || []);
+      renderTodos(msg.todos || []);
+      setActiveAgent(msg.agent || "assistant", false);
+      addNotice(`Loaded conversation “${msg.name}”.`);
+      break;
     case "tts_end":
       break;
     case "history_reset":
       chatEl.innerHTML = "";
+      toolCards.clear();
+      subCards.clear();
+      currentAssistantEl = null;
       addNotice("Conversation cleared.");
       break;
     case "error":
@@ -115,6 +189,116 @@ function setState(s) {
   statusPill.textContent = s;
   statusPill.className = `pill ${s}`;
 }
+
+// ---------------------------------------------------------------------------
+// Agents
+// ---------------------------------------------------------------------------
+function setActiveAgent(name, announce) {
+  const changed = name !== currentAgent;
+  currentAgent = name;
+  agentChip.textContent = `@${name}`;
+  renderAgents();
+  if (announce && changed) addNotice(`Switched to @${name}.`);
+}
+
+function renderAgents() {
+  agentList.innerHTML = "";
+  for (const a of agents) {
+    const el = document.createElement("div");
+    el.className = "agent-item" + (a.name === currentAgent ? " active" : "");
+    el.innerHTML = `<div class="agent-name"></div>
+                    <div class="agent-desc"></div>
+                    <div class="agent-access"></div>`;
+    el.querySelector(".agent-name").textContent = `@${a.name}`;
+    el.querySelector(".agent-desc").textContent = a.description;
+    el.querySelector(".agent-access").textContent = a.access || "";
+    el.addEventListener("click", () => send({ type: "set_agent", agent: a.name }));
+    agentList.appendChild(el);
+  }
+}
+
+async function refreshAgents() {
+  try {
+    const res = await fetch("/api/agents");
+    const data = await res.json();
+    agents = data.agents || agents;
+    renderAgents();
+    const init = data.initiator || {};
+    let text = `initiator: ${init.status || "idle"}`;
+    if (init.status === "done" && init.total > 0) {
+      text = `initiator: ${init.total} tools → ${init.read} read · ` +
+             `${init.modify} modify (${init.method})`;
+    } else if (init.status === "done") {
+      text = "initiator: no tools to classify";
+    } else if (init.status === "running") {
+      text = "initiator: classifying tools…";
+    }
+    initiatorStatus.textContent = text;
+  } catch { /* server restarting */ }
+}
+
+// ---------------------------------------------------------------------------
+// @mention popup
+// ---------------------------------------------------------------------------
+let mentionItems = [], mentionIdx = 0;
+
+function updateMentionPop() {
+  const m = /^@([\w-]*)$/.exec(textInput.value);
+  if (!m || !agents.length) { hideMentionPop(); return; }
+  const prefix = m[1].toLowerCase();
+  mentionItems = agents.filter((a) => a.name.startsWith(prefix));
+  if (!mentionItems.length) { hideMentionPop(); return; }
+  mentionIdx = Math.min(mentionIdx, mentionItems.length - 1);
+  mentionPop.innerHTML = "";
+  mentionItems.forEach((a, i) => {
+    const el = document.createElement("div");
+    el.className = "mention-item" + (i === mentionIdx ? " sel" : "");
+    el.innerHTML = `<b></b><span></span>`;
+    el.querySelector("b").textContent = `@${a.name}`;
+    el.querySelector("span").textContent = a.description;
+    el.addEventListener("mousedown", (e) => { e.preventDefault(); pickMention(i); });
+    mentionPop.appendChild(el);
+  });
+  mentionPop.classList.remove("hidden");
+}
+
+function hideMentionPop() { mentionPop.classList.add("hidden"); mentionItems = []; }
+
+function pickMention(i) {
+  const a = mentionItems[i];
+  if (!a) return;
+  textInput.value = `@${a.name} `;
+  hideMentionPop();
+  textInput.focus();
+}
+
+textInput.addEventListener("input", () => { mentionIdx = 0; updateMentionPop(); });
+textInput.addEventListener("blur", () => setTimeout(hideMentionPop, 150));
+textInput.addEventListener("keydown", (e) => {
+  if (mentionItems.length) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      mentionIdx = (mentionIdx + 1) % mentionItems.length; updateMentionPop(); return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      mentionIdx = (mentionIdx - 1 + mentionItems.length) % mentionItems.length;
+      updateMentionPop(); return;
+    }
+    if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault(); pickMention(mentionIdx); return;
+    }
+    if (e.key === "Escape") { hideMentionPop(); return; }
+  }
+  if (e.key === "Enter") sendTyped();
+});
+
+agentChip.addEventListener("click", () => {
+  textInput.value = "@";
+  textInput.focus();
+  mentionIdx = 0;
+  updateMentionPop();
+});
 
 // ---------------------------------------------------------------------------
 // Chat rendering
@@ -145,13 +329,28 @@ function addUserMessage(text) {
   scrollChat();
 }
 
+function newAssistantBubble(agent) {
+  const el = document.createElement("div");
+  el.className = "msg assistant";
+  if (agent && agent !== "assistant") {
+    const tag = document.createElement("div");
+    tag.className = "agent-tag";
+    tag.textContent = `@${agent}`;
+    el.appendChild(tag);
+  }
+  const body = document.createElement("span");
+  body.className = "msg-body";
+  el.appendChild(body);
+  chatEl.appendChild(el);
+  return el;
+}
+
 function appendAssistantText(text) {
   if (!currentAssistantEl) {
-    currentAssistantEl = document.createElement("div");
-    currentAssistantEl.className = "msg assistant streaming";
-    chatEl.appendChild(currentAssistantEl);
+    currentAssistantEl = newAssistantBubble(streamingAgent);
+    currentAssistantEl.classList.add("streaming");
   }
-  currentAssistantEl.textContent += text;
+  currentAssistantEl.querySelector(".msg-body").textContent += text;
   scrollChat();
 }
 
@@ -167,9 +366,19 @@ function finalizeAssistant(interrupted) {
   currentAssistantEl = null;
 }
 
-function addToolCard(msg) {
-  // A tool call ends the current text bubble segment.
-  finalizeAssistant(false);
+function addAssistantFull(agent, text, interrupted) {
+  const el = newAssistantBubble(agent);
+  el.querySelector(".msg-body").textContent = text;
+  if (interrupted) {
+    const tag = document.createElement("span");
+    tag.className = "interrupted-tag";
+    tag.textContent = "⏹ interrupted";
+    el.appendChild(tag);
+  }
+}
+
+// ---- tool cards -----------------------------------------------------------
+function buildToolCard(name, server, args) {
   const card = document.createElement("div");
   card.className = "tool-card";
   card.innerHTML = `
@@ -185,13 +394,26 @@ function addToolCard(msg) {
       <div class="lbl">result</div>
       <pre class="result">…</pre>
     </div>`;
-  card.querySelector(".tool-name").textContent = msg.tool;
-  card.querySelector(".tool-server").textContent = `via ${msg.server}`;
-  let args = msg.arguments;
-  try { args = JSON.stringify(JSON.parse(msg.arguments), null, 2); } catch { /* raw */ }
-  card.querySelector(".args").textContent = args;
+  card.querySelector(".tool-name").textContent = name;
+  card.querySelector(".tool-server").textContent = `via ${server}`;
+  let pretty = args;
+  try { pretty = JSON.stringify(JSON.parse(args), null, 2); } catch { /* raw */ }
+  card.querySelector(".args").textContent = pretty;
   card.querySelector(".tool-head").addEventListener("click", () =>
     card.classList.toggle("open"));
+  return card;
+}
+
+function settleToolCard(card, ok, result) {
+  card.classList.add(ok ? "done" : "failed");
+  card.querySelector(".tool-status").textContent = ok ? "done" : "failed";
+  card.querySelector(".result").textContent = result;
+}
+
+function addToolCard(msg) {
+  // A tool call ends the current text bubble segment.
+  finalizeAssistant(false);
+  const card = buildToolCard(msg.tool, msg.server, msg.arguments);
   chatEl.appendChild(card);
   toolCards.set(msg.id, card);
   scrollChat();
@@ -200,11 +422,292 @@ function addToolCard(msg) {
 function completeToolCard(msg) {
   const card = toolCards.get(msg.id);
   if (!card) return;
-  card.classList.add(msg.ok ? "done" : "failed");
-  card.querySelector(".tool-status").textContent = msg.ok ? "done" : "failed";
-  card.querySelector(".result").textContent = msg.result;
+  settleToolCard(card, msg.ok, msg.result);
   scrollChat();
 }
+
+// ---- sub-agent cards (collapsible) -----------------------------------------
+function buildSubCard(id, name, task, tools) {
+  const card = document.createElement("div");
+  card.className = "sub-card open";
+  card.innerHTML = `
+    <div class="sub-head">
+      <span class="sub-caret">▾</span>
+      <span class="sub-icon">🤖</span>
+      <span class="sub-name"></span>
+      <span class="sub-hint">sub-agent</span>
+      <span class="sub-status">running…</span>
+    </div>
+    <div class="sub-body">
+      <div class="lbl">instruction</div>
+      <div class="sub-task"></div>
+      <div class="lbl">tools granted</div>
+      <div class="sub-tools"></div>
+      <div class="sub-text"></div>
+    </div>`;
+  card.querySelector(".sub-name").textContent = name;
+  card.querySelector(".sub-task").textContent = task;
+  const toolsEl = card.querySelector(".sub-tools");
+  if (tools && tools.length) {
+    for (const t of tools) {
+      const chip = document.createElement("span");
+      chip.className = "tool-chip";
+      chip.textContent = t;
+      toolsEl.appendChild(chip);
+    }
+  } else {
+    toolsEl.textContent = "(none)";
+  }
+  card.querySelector(".sub-head").addEventListener("click", () => {
+    card.classList.toggle("open");
+    card.querySelector(".sub-caret").textContent =
+      card.classList.contains("open") ? "▾" : "▸";
+  });
+  return card;
+}
+
+function addSubCard(msg) {
+  finalizeAssistant(false);
+  const card = buildSubCard(msg.id, msg.name, msg.task, msg.tools);
+  chatEl.appendChild(card);
+  subCards.set(msg.id, {
+    card,
+    body: card.querySelector(".sub-body"),
+    textEl: card.querySelector(".sub-text"),
+    calls: new Map(),
+  });
+  scrollChat();
+}
+
+function appendSubText(msg) {
+  const sub = subCards.get(msg.id);
+  if (!sub) return;
+  sub.textEl.textContent += msg.text;
+  scrollChat();
+}
+
+function addSubToolCall(msg) {
+  const sub = subCards.get(msg.id);
+  if (!sub) return;
+  const det = document.createElement("details");
+  det.className = "sub-tool";
+  det.innerHTML = `<summary>🔧 <span class="st-name"></span>
+                   <span class="st-status">running…</span></summary>
+                   <pre class="st-args"></pre><pre class="st-result">…</pre>`;
+  det.querySelector(".st-name").textContent = msg.name;
+  let pretty = msg.arguments;
+  try { pretty = JSON.stringify(JSON.parse(msg.arguments), null, 2); } catch { /* raw */ }
+  det.querySelector(".st-args").textContent = pretty;
+  sub.body.appendChild(det);
+  sub.calls.set(msg.call_id, det);
+  // Fresh text element so post-tool deltas appear below the tool line.
+  sub.textEl = document.createElement("div");
+  sub.textEl.className = "sub-text";
+  sub.body.appendChild(sub.textEl);
+  scrollChat();
+}
+
+function completeSubToolCall(msg) {
+  const sub = subCards.get(msg.id);
+  if (!sub) return;
+  const det = sub.calls.get(msg.call_id);
+  if (!det) return;
+  det.querySelector(".st-status").textContent = msg.ok ? "done" : "failed";
+  det.classList.add(msg.ok ? "done" : "failed");
+  det.querySelector(".st-result").textContent = msg.result;
+  scrollChat();
+}
+
+function finishSubCard(msg) {
+  const sub = subCards.get(msg.id);
+  if (!sub) return;
+  const status = sub.card.querySelector(".sub-status");
+  status.textContent = msg.ok ? "✓ done" : "✗ failed";
+  sub.card.classList.add(msg.ok ? "done" : "failed");
+  // Auto-collapse when finished; the head still shows the outcome.
+  sub.card.classList.remove("open");
+  sub.card.querySelector(".sub-caret").textContent = "▸";
+  scrollChat();
+}
+
+function interruptSubCards() {
+  for (const sub of subCards.values()) {
+    const status = sub.card.querySelector(".sub-status");
+    if (status.textContent === "running…") {
+      status.textContent = "⏹ interrupted";
+      sub.card.classList.add("failed");
+    }
+  }
+}
+
+function addSubagentFull(e) {
+  const card = buildSubCard(e.id, e.name, e.task, e.tools);
+  card.classList.remove("open");
+  card.querySelector(".sub-caret").textContent = "▸";
+  const body = card.querySelector(".sub-body");
+  const textEl = card.querySelector(".sub-text");
+  textEl.textContent = e.text || "";
+  for (const ev of e.events || []) {
+    const det = document.createElement("details");
+    det.className = "sub-tool " + (ev.ok ? "done" : "failed");
+    det.innerHTML = `<summary>🔧 <span class="st-name"></span>
+                     <span class="st-status"></span></summary>
+                     <pre class="st-args"></pre><pre class="st-result"></pre>`;
+    det.querySelector(".st-name").textContent = ev.name;
+    det.querySelector(".st-status").textContent = ev.ok ? "done" : "failed";
+    det.querySelector(".st-args").textContent = ev.arguments;
+    det.querySelector(".st-result").textContent = ev.result;
+    body.appendChild(det);
+  }
+  const status = card.querySelector(".sub-status");
+  status.textContent = e.status === "done" ? "✓ done" :
+    e.status === "interrupted" ? "⏹ interrupted" : "✗ failed";
+  card.classList.add(e.status === "done" ? "done" : "failed");
+  chatEl.appendChild(card);
+}
+
+// ---- transcript replay (conversation load) ---------------------------------
+function replayTranscript(events) {
+  for (const e of events) {
+    if (e.kind === "user") addUserMessage(e.text);
+    else if (e.kind === "assistant") addAssistantFull(e.agent, e.text, e.interrupted);
+    else if (e.kind === "tool") {
+      const card = buildToolCard(e.tool || e.name, e.server, e.arguments);
+      settleToolCard(card, e.ok, e.result || "");
+      chatEl.appendChild(card);
+    } else if (e.kind === "subagent") addSubagentFull(e);
+  }
+  scrollChat();
+}
+
+// ---------------------------------------------------------------------------
+// Plan / to-do list panel
+// ---------------------------------------------------------------------------
+function renderTodos(todos) {
+  todoList.innerHTML = "";
+  if (!todos || !todos.length) {
+    todoList.innerHTML =
+      `<div class="side-empty">No plan yet — ask <b>@planner</b> for one.</div>`;
+    return;
+  }
+  todos.forEach((t, i) => {
+    const el = document.createElement("div");
+    el.className = `todo-item ${t.status}`;
+    const icon = t.status === "done" ? "✓" : t.status === "in_progress" ? "▶" : "○";
+    el.innerHTML = `<span class="todo-icon"></span><span class="todo-text"></span>`;
+    el.querySelector(".todo-icon").textContent = icon;
+    el.querySelector(".todo-text").textContent = `${i + 1}. ${t.text}`;
+    todoList.appendChild(el);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Conversations (save / load)
+// ---------------------------------------------------------------------------
+convBtn.addEventListener("click", () => {
+  convPanel.classList.toggle("hidden");
+  if (!convPanel.classList.contains("hidden")) refreshConversations();
+});
+document.addEventListener("click", (e) => {
+  if (!convPanel.classList.contains("hidden") &&
+      !convPanel.contains(e.target) && e.target !== convBtn) {
+    convPanel.classList.add("hidden");
+  }
+});
+
+convSaveBtn.addEventListener("click", () => {
+  send({ type: "save", name: convName.value.trim() });
+  convName.value = "";
+});
+
+async function refreshConversations() {
+  try {
+    const res = await fetch("/api/conversations");
+    renderConversations(await res.json());
+  } catch { /* server restarting */ }
+}
+
+function renderConversations(items) {
+  convList.innerHTML = "";
+  if (!items.length) {
+    convList.innerHTML = `<div class="side-empty">No saved conversations yet.</div>`;
+    return;
+  }
+  for (const it of items) {
+    const el = document.createElement("div");
+    el.className = "conv-item";
+    el.innerHTML = `
+      <div class="conv-meta">
+        <div class="conv-name"></div>
+        <div class="conv-sub"></div>
+      </div>
+      <button class="load ghost">Load</button>
+      <button class="del ghost" title="Delete">✕</button>`;
+    el.querySelector(".conv-name").textContent = it.name;
+    el.querySelector(".conv-sub").textContent =
+      [it.saved_at, it.preview].filter(Boolean).join(" · ");
+    el.querySelector(".load").addEventListener("click", () => {
+      send({ type: "load", name: it.name });
+      convPanel.classList.add("hidden");
+    });
+    el.querySelector(".del").addEventListener("click", async () => {
+      await fetch(`/api/conversations/${encodeURIComponent(it.name)}`,
+        { method: "DELETE" });
+      refreshConversations();
+    });
+    convList.appendChild(el);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Model switch
+// ---------------------------------------------------------------------------
+function updateModelInfo(model, speechEnabled) {
+  modelInfo.textContent = `${model} · ${lastVoice}` +
+    (speechEnabled ? "" : " · ⚠ speech not configured");
+  modelInfo.dataset.model = model;
+  modelInfo.dataset.speech = speechEnabled ? "1" : "";
+}
+
+modelEditBtn.addEventListener("click", () => {
+  modelInput.value = modelInfo.dataset.model || "";
+  modelInfo.classList.add("hidden");
+  modelEditBtn.classList.add("hidden");
+  modelInput.classList.remove("hidden");
+  modelInput.focus();
+  modelInput.select();
+});
+
+function closeModelInput() {
+  modelInput.classList.add("hidden");
+  modelInfo.classList.remove("hidden");
+  modelEditBtn.classList.remove("hidden");
+}
+
+modelInput.addEventListener("keydown", async (e) => {
+  if (e.key === "Escape") { closeModelInput(); return; }
+  if (e.key !== "Enter") return;
+  const model = modelInput.value.trim();
+  if (!model) { closeModelInput(); return; }
+  try {
+    const res = await fetch("/api/model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model }),
+    });
+    if (res.ok) {
+      updateModelInfo(model, !!modelInfo.dataset.speech);
+      addNotice(`LLM model set to ${model} (applies to the next reply).`);
+    } else {
+      const err = await res.json().catch(() => ({}));
+      addError(err.detail || `Model change failed (${res.status}).`);
+    }
+  } catch (err) {
+    addError(`Model change failed: ${err.message}`);
+  }
+  closeModelInput();
+});
+modelInput.addEventListener("blur", closeModelInput);
 
 // ---------------------------------------------------------------------------
 // Microphone capture + VAD + barge-in
@@ -334,9 +837,9 @@ function sendTyped() {
   stopPlayback();
   send({ type: "text", text });
   textInput.value = "";
+  hideMentionPop();
 }
 sendBtn.addEventListener("click", sendTyped);
-textInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendTyped(); });
 resetBtn.addEventListener("click", () => { stopPlayback(); send({ type: "reset" }); });
 
 // ---------------------------------------------------------------------------
@@ -397,11 +900,13 @@ function renderServers(servers) {
     el.querySelector(".remove").addEventListener("click", async () => {
       await fetch(`/api/mcp/servers/${encodeURIComponent(s.name)}`, { method: "DELETE" });
       refreshServers();
+      refreshAgents();
     });
     el.querySelector(".reconnect").addEventListener("click", async () => {
       el.querySelector(".reconnect").textContent = "…";
       await fetch(`/api/mcp/servers/${encodeURIComponent(s.name)}/reconnect`, { method: "POST" });
       refreshServers();
+      refreshAgents();
     });
     mcpList.appendChild(el);
   }
@@ -436,6 +941,7 @@ mcpForm.addEventListener("submit", async (e) => {
   } finally {
     btn.disabled = false; btn.textContent = "Add & connect";
     refreshServers();
+    refreshAgents();
   }
 });
 
@@ -444,4 +950,5 @@ mcpForm.addEventListener("submit", async (e) => {
 // ---------------------------------------------------------------------------
 connect();
 refreshServers();
-setInterval(refreshServers, 10000);
+refreshAgents();
+setInterval(() => { refreshServers(); refreshAgents(); }, 10000);

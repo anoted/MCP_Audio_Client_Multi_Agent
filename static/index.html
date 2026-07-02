@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NIM Audio Client</title>
+  <title>Voice Client</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -11,14 +11,28 @@
     <div class="brand">
       <span class="logo">🎙️</span>
       <div>
-        <h1>NIM Audio Client</h1>
-        <div class="sub" id="model-info">connecting…</div>
+        <h1>Voice Client</h1>
+        <div class="sub">
+          <span id="model-info">connecting…</span>
+          <button id="model-edit-btn" class="tiny ghost" title="Change LLM model">✎</button>
+          <input id="model-input" class="hidden" placeholder="exact model name" spellcheck="false">
+        </div>
       </div>
     </div>
     <div class="header-right">
+      <button id="theme-btn" class="ghost" title="Toggle light/dark mode">☀️</button>
+      <button id="conv-btn" class="ghost" title="Save / load conversations">💾</button>
       <span id="conn-dot" class="dot off" title="WebSocket"></span>
       <span id="status-pill" class="pill">connecting</span>
       <button id="reset-btn" class="ghost" title="Clear conversation">Reset</button>
+    </div>
+    <div id="conv-panel" class="hidden">
+      <h3>Conversations</h3>
+      <div class="conv-save-row">
+        <input id="conv-name" placeholder="name (optional)">
+        <button id="conv-save-btn">Save current</button>
+      </div>
+      <div id="conv-list" class="conv-list"></div>
     </div>
   </header>
 
@@ -26,29 +40,46 @@
     <section id="chat-wrap">
       <div id="chat">
         <div class="notice">
-          Click the microphone to start talking. Speaking while the assistant is
-          talking interrupts it (barge-in). You can also type below.
+          Click the microphone to start talking — speaking over the assistant
+          interrupts it. Type <b>@explorer</b>, <b>@planner</b>, <b>@manager</b>
+          or <b>@assistant</b> to switch agents; voice always talks to the
+          active agent.
         </div>
       </div>
     </section>
 
-    <aside id="mcp-panel">
-      <h2>MCP Servers</h2>
-      <div id="mcp-list" class="mcp-list"></div>
-      <form id="mcp-form" autocomplete="off">
-        <h3>Register server</h3>
-        <input id="mcp-name" placeholder="name (e.g. demo)" required
-               pattern="[a-zA-Z0-9_\-]{1,32}">
-        <select id="mcp-transport">
-          <option value="stdio">stdio (local command)</option>
-          <option value="http">streamable HTTP</option>
-          <option value="sse">SSE</option>
-        </select>
-        <input id="mcp-command" placeholder="command, e.g. python examples/demo_mcp_server.py">
-        <input id="mcp-url" placeholder="url, e.g. http://localhost:9000/mcp" class="hidden">
-        <button type="submit">Add & connect</button>
-        <div id="mcp-error" class="form-error"></div>
-      </form>
+    <aside id="side-panel">
+      <section>
+        <h2>Agents</h2>
+        <div id="initiator-status" class="initiator-status">initiator: idle</div>
+        <div id="agent-list" class="agent-list"></div>
+      </section>
+
+      <section>
+        <h2>Plan</h2>
+        <div id="todo-list" class="todo-list">
+          <div class="side-empty">No plan yet — ask <b>@planner</b> for one.</div>
+        </div>
+      </section>
+
+      <section>
+        <h2>MCP Servers</h2>
+        <div id="mcp-list" class="mcp-list"></div>
+        <form id="mcp-form" autocomplete="off">
+          <h3>Register server</h3>
+          <input id="mcp-name" placeholder="name (e.g. demo)" required
+                 pattern="[a-zA-Z0-9_\-]{1,32}">
+          <select id="mcp-transport">
+            <option value="stdio">stdio (local command)</option>
+            <option value="http">streamable HTTP</option>
+            <option value="sse">SSE</option>
+          </select>
+          <input id="mcp-command" placeholder="command, e.g. python examples/demo_mcp_server.py">
+          <input id="mcp-url" placeholder="url, e.g. http://localhost:9000/mcp" class="hidden">
+          <button type="submit">Add & connect</button>
+          <div id="mcp-error" class="form-error"></div>
+        </form>
+      </section>
     </aside>
   </main>
 
@@ -59,7 +90,12 @@
       </svg>
     </button>
     <div id="vad-meter"><div id="vad-fill"></div></div>
-    <input id="text-input" placeholder="Type a message (Enter to send)…">
+    <span id="active-agent" class="agent-chip" title="Active agent">@assistant</span>
+    <div id="input-wrap">
+      <div id="mention-pop" class="hidden"></div>
+      <input id="text-input" placeholder="Type a message — @agent to switch (Enter to send)…"
+             autocomplete="off" spellcheck="false">
+    </div>
     <button id="send-btn">Send</button>
   </footer>
 

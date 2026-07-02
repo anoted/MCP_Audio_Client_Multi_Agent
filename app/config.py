@@ -52,6 +52,7 @@ class Settings:
     tts_sample_rate: int = int(os.getenv("TTS_SAMPLE_RATE", "22050"))
 
     mcp_registry_path: str = os.getenv("MCP_REGISTRY_PATH", "mcp_servers.json")
+    conversations_dir: str = os.getenv("CONVERSATIONS_DIR", "conversations")
 
     @property
     def speech_configured(self) -> bool:

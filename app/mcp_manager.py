@@ -196,8 +196,13 @@ class MCPManager:
 
     # -- tool surface for the LLM --------------------------------------------
 
-    def openai_tools(self) -> list[dict]:
-        """OpenAI function-calling specs for every connected server's tools."""
+    def openai_tools(self, allowed: set[str] | None = None) -> list[dict]:
+        """OpenAI function-calling specs for every connected server's tools.
+
+        The routing table is always rebuilt from the full inventory; `allowed`
+        only filters which specs are returned (used to restrict an agent's or
+        sub-agent's tool surface).
+        """
         self._route.clear()
         specs = []
         for name, conn in self.connections.items():
@@ -221,6 +226,8 @@ class MCPManager:
                         },
                     }
                 )
+        if allowed is not None:
+            specs = [s for s in specs if s["function"]["name"] in allowed]
         return specs
 
     def resolve(self, api_name: str) -> tuple[str, str] | None:

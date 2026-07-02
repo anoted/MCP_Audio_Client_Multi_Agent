@@ -63,6 +63,16 @@ async def chat_stream(
     yield {"type": "end", "finish_reason": finish_reason, "tool_calls": tool_calls}
 
 
+async def complete(messages: list[dict], temperature: float = 0.0) -> str:
+    """One-shot non-streaming completion (used by the initiator)."""
+    resp = await _client().chat.completions.create(
+        model=settings.llm_model,
+        messages=messages,
+        temperature=temperature,
+    )
+    return resp.choices[0].message.content or ""
+
+
 _MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 _MD_NOISE = re.compile(r"[*_`#]+")
 
