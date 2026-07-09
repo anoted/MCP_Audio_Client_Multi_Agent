@@ -4,16 +4,21 @@ Primary agents (each keeps its own chat history in the session):
 - assistant  default conversational agent, full tool access
 - explorer   investigates with read-only tools
 - planner    researches (read-only) and produces a to-do list via submit_plan
-- manager    works through the to-do list by deploying tool-restricted
-             sub-agents (run_subagent) and ticking items off (set_todo_status)
+- manager    plans via run_planner and works through the to-do list by
+             deploying sub-agents (run_subagent) whose tools it grants by
+             category / access class, ticking items off (set_todo_status)
 
 The Initiator is a one-shot background agent: whenever the MCP tool inventory
-changes it classifies every tool as "read" or "modify" (LLM first, keyword
-heuristic as fallback), assigns tool sets to the primary agents, and then
-discards its working context — only the resulting assignment is kept.
+changes it classifies every tool's access ("read" or "modify") and its domain
+category/keywords (LLM first, keyword heuristic as fallback), assigns tool
+sets to the primary agents, and then discards its working context — only the
+resulting assignment is kept. The manager's grant selectors ("read", "all",
+"assignments", "write:modules", exact names, …) are resolved against this
+classification by Initiator.expand().
 """
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 
 from . import llm
@@ -87,10 +92,11 @@ RUN_SUBAGENT_SPEC = {
         "name": "run_subagent",
         "description": (
             "Create and run a sub-agent to carry out one task. Give it a short "
-            "name, a self-contained instruction, and the minimal list of tools "
-            "it needs (exact tool names from the available-tools list). The "
-            "sub-agent only sees the tools you grant it. Returns its final "
-            "report."
+            "name, a self-contained instruction (it shares no memory with you — "
+            "include every id and fact it needs), and tool grants. Grant whole "
+            "categories or access classes rather than single tools so the "
+            "sub-agent has everything the task might need. It only sees the "
+            "tools you grant. Returns its final report."
         ),
         "parameters": {
             "type": "object",
@@ -103,10 +109,43 @@ RUN_SUBAGENT_SPEC = {
                 "tools": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Exact tool names the sub-agent may use.",
+                    "description": (
+                        "Tool grants, each one of: 'read' (every read-only "
+                        "tool), 'write' (every modifying tool), 'all', a "
+                        "category/keyword such as 'assignments' or 'modules' "
+                        "(grants every matching tool), 'read:<keyword>' / "
+                        "'write:<keyword>' to narrow a category by access, or "
+                        "an exact tool name. Example: [\"read\", \"quizzes\"]."
+                    ),
                 },
             },
             "required": ["name", "instruction", "tools"],
+        },
+    },
+}
+
+RUN_PLANNER_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "run_planner",
+        "description": (
+            "Run the Planner agent: it researches with read-only tools and "
+            "saves a new to-do list, replacing any current plan. Use it when "
+            "there is no plan yet or the current plan no longer fits — you do "
+            "not need the user to run the planner for you."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": (
+                        "What to plan, complete and self-contained (the "
+                        "planner does not see your conversation)."
+                    ),
+                }
+            },
+            "required": ["task"],
         },
     },
 }
@@ -165,19 +204,26 @@ AGENTS: dict[str, AgentProfile] = {
     ),
     "manager": AgentProfile(
         name="manager",
-        description="Executes the to-do list by deploying sub-agents.",
+        description="Plans via the planner and executes by deploying sub-agents.",
         system_prompt=(
-            "You are Manager. You do not run tools yourself — you delegate. "
-            "Work through the current to-do list one item at a time: mark the "
-            "item in_progress with set_todo_status, deploy a sub-agent with "
-            "run_subagent (give it a clear self-contained instruction and only "
-            "the minimal tools it needs from the available-tools list), check "
-            "its report, then mark the item done. If there is no plan yet, "
-            "either ask the user or derive a quick plan yourself with "
-            "submit-style steps described aloud. Keep the user informed with "
-            "short spoken updates between steps. " + _VOICE_STYLE
+            "You are Manager. You never run task tools yourself — you plan "
+            "and delegate. If there is no to-do list yet (or it no longer "
+            "fits the task), first call run_planner with the full task; it "
+            "researches and saves the plan. Then work through the list one "
+            "item at a time: mark it in_progress with set_todo_status, deploy "
+            "a sub-agent with run_subagent, check its report, then mark it "
+            "done. Sub-agents start blank — each instruction must contain "
+            "every id, name, and fact from earlier reports that the sub-agent "
+            "needs. Grant tools broadly using the grant selectors from the "
+            "tool inventory: ['read'] for research or verification, a "
+            "category like ['modules'] or ['assignments'] for focused work, "
+            "combinations like ['read', 'quizzes'] when it must look things "
+            "up and modify — so a sub-agent is never missing a tool mid-task. "
+            "Grant single exact tools only when one tool clearly suffices. "
+            "Keep the user informed with short spoken updates between steps. "
+            + _VOICE_STYLE
         ),
-        virtual_tools=(RUN_SUBAGENT_SPEC, SET_TODO_STATUS_SPEC),
+        virtual_tools=(RUN_PLANNER_SPEC, RUN_SUBAGENT_SPEC, SET_TODO_STATUS_SPEC),
     ),
 }
 
@@ -188,20 +234,38 @@ SUBAGENT_PROMPT = (
     "Do not ask questions — make reasonable assumptions and finish."
 )
 
+PLANNER_SUBAGENT_PROMPT = (
+    "You are Planner, invoked by the manager as a background planning agent. "
+    "Research the task with your read-only tools as needed, then break it "
+    "into a short ordered list of concrete steps and save it by calling "
+    "submit_plan — this is required. Each step must be small enough for one "
+    "focused sub-agent to complete. After submit_plan succeeds, reply with a "
+    "brief plain-text summary of the plan. Do not ask questions — make "
+    "reasonable assumptions and finish."
+)
+
 
 # --- dynamic per-turn context ----------------------------------------------------
 
 
-def _inventory_text(mcp: MCPManager, initiator: "Initiator") -> str:
+def _inventory_text(
+    mcp: MCPManager, initiator: "Initiator", selectors: bool = False
+) -> str:
     specs = mcp.openai_tools()
     if not specs:
         return "No MCP tools are currently connected."
-    lines = ["Available tools (name — access — description):"]
+    lines = ["Available tools (name — access — category — description):"]
     for spec in specs:
         fn = spec["function"]
         access = initiator.classes.get(fn["name"], "unclassified")
+        category = initiator.category.get(fn["name"], "-")
         desc = (fn.get("description") or "").strip().replace("\n", " ")[:120]
-        lines.append(f"- {fn['name']} — {access} — {desc}")
+        lines.append(f"- {fn['name']} — {access} — {category} — {desc}")
+    if selectors:
+        summary = initiator.grant_summary()
+        if summary:
+            lines.append("")
+            lines.append(f"Grant selectors for run_subagent: {summary}")
     return "\n".join(lines)
 
 
@@ -221,7 +285,11 @@ def dynamic_context(
     if agent == "planner":
         return _inventory_text(mcp, initiator)
     if agent == "manager":
-        return _inventory_text(mcp, initiator) + "\n\n" + _todos_text(todos)
+        return (
+            _inventory_text(mcp, initiator, selectors=True)
+            + "\n\n"
+            + _todos_text(todos)
+        )
     return None
 
 
@@ -241,10 +309,21 @@ _READ_WORDS = (
 
 _CLASSIFY_SYSTEM = (
     "You classify tools for an agent system. Reply with ONLY a JSON object "
-    'mapping every tool name to "read" (it only observes, retrieves, or '
-    'computes) or "modify" (it creates, changes, deletes, sends, or executes '
-    "anything with side effects). No other text."
+    "mapping every tool name to an object with two keys: \"access\" — "
+    "\"read\" (it only observes, retrieves, or computes) or \"modify\" (it "
+    "creates, changes, deletes, sends, or executes anything with side "
+    "effects) — and \"category\" — one lowercase word for the kind of thing "
+    "the tool works on (e.g. assignments, submissions, quizzes, modules, "
+    "pages, files, announcements). Use the SAME category word for every tool "
+    "that works on the same kind of thing. No other text."
 )
+
+# Leading verbs stripped from tool names when deriving domain keywords.
+_VERB_TOKENS = {
+    "list", "get", "read", "fetch", "search", "find", "show", "view", "check",
+    "create", "add", "update", "delete", "remove", "set", "publish", "upload",
+    "send", "post", "grade", "run", "make", "new", "build", "edit",
+}
 
 
 def _heuristic_class(name: str, description: str) -> str:
@@ -256,12 +335,51 @@ def _heuristic_class(name: str, description: str) -> str:
     return "modify"  # unknown -> safe default
 
 
+def _name_tokens(api_name: str) -> tuple[str, list[str]]:
+    """Split 'Server__tool_name' into (server, [tokens])."""
+    parts = api_name.lower().split("__", 1)
+    server = parts[0] if len(parts) == 2 else ""
+    tokens = [t for t in re.split(r"[^a-z0-9]+", parts[-1]) if t]
+    return server, tokens
+
+
+def _keyword_tags(api_name: str) -> set[str]:
+    """Domain keywords for a tool: server name + non-verb name tokens."""
+    server, tokens = _name_tokens(api_name)
+    tags = {t for t in tokens if t not in _VERB_TOKENS and not t.isdigit()}
+    if server:
+        tags.add(server)
+    return tags
+
+
+def _heuristic_category(api_name: str) -> str:
+    """First non-verb token of the tool name, e.g. list_assignments -> assignments."""
+    _, tokens = _name_tokens(api_name)
+    for tok in tokens:
+        if tok not in _VERB_TOKENS and not tok.isdigit():
+            return tok
+    return "misc"
+
+
+def _canonical_categories(category: dict[str, str]) -> dict[str, str]:
+    """Merge singular/plural variants ('module'/'modules', 'quiz'/'quizzes')."""
+    cats = sorted(set(category.values()), key=len)
+    remap: dict[str, str] = {}
+    for i, short in enumerate(cats):
+        for longer in cats[i + 1:]:
+            if longer.startswith(short) and len(longer) - len(short) <= 3:
+                remap[longer] = remap.get(short, short)
+    return {n: remap.get(c, c) for n, c in category.items()}
+
+
 class Initiator:
     """One-shot background classifier; keeps only the tool assignment."""
 
     def __init__(self) -> None:
         self.status = "idle"  # idle | running | done | error
         self.classes: dict[str, str] = {}  # tool api name -> read | modify
+        self.category: dict[str, str] = {}  # tool api name -> primary category
+        self.tags: dict[str, set[str]] = {}  # tool api name -> keyword tags
         self.method = ""  # llm | heuristic
         self._lock = asyncio.Lock()
 
@@ -276,30 +394,47 @@ class Initiator:
                 ]
                 if not tools:
                     self.classes = {}
+                    self.category = {}
+                    self.tags = {}
                     self.method = "none"
                     self.status = "done"
                     return
-                classes: dict[str, str] | None = None
+                llm_result: dict[str, tuple[str, str]] | None = None
                 try:
-                    classes = await asyncio.wait_for(self._classify_llm(tools), 45)
+                    llm_result = await asyncio.wait_for(
+                        self._classify_llm(tools), 45
+                    )
                     self.method = "llm"
                 except Exception:  # noqa: BLE001 — fall back to keywords
-                    classes = None
-                if classes is None:
-                    classes = {n: _heuristic_class(n, d) for n, d in tools}
+                    llm_result = None
+                if llm_result is None:
+                    llm_result = {}
                     self.method = "heuristic"
-                # Anything the LLM missed gets the heuristic answer.
+                classes: dict[str, str] = {}
+                category: dict[str, str] = {}
+                # Anything the LLM missed gets the heuristic answer; keyword
+                # tags always come from the tool name so selector matching
+                # works even without the LLM.
                 for name, desc in tools:
-                    classes.setdefault(name, _heuristic_class(name, desc))
-                self.classes = {n: c for n, c in classes.items()
-                                if n in {t[0] for t in tools}}
+                    access, cat = llm_result.get(name, ("", ""))
+                    classes[name] = access or _heuristic_class(name, desc)
+                    category[name] = cat or _heuristic_category(name)
+                category = _canonical_categories(category)
+                self.classes = classes
+                self.category = category
+                self.tags = {
+                    name: _keyword_tags(name) | {category[name]}
+                    for name, _ in tools
+                }
                 self.status = "done"
             except Exception:  # noqa: BLE001
                 self.status = "error"
             # Working context (prompts, LLM reply) goes out of scope here —
-            # only self.classes survives.
+            # only the classes/category/tags assignment survives.
 
-    async def _classify_llm(self, tools: list[tuple[str, str]]) -> dict[str, str] | None:
+    async def _classify_llm(
+        self, tools: list[tuple[str, str]]
+    ) -> dict[str, tuple[str, str]] | None:
         listing = "\n".join(
             f"- {name}: {desc.strip()[:200]}" for name, desc in tools
         )
@@ -316,11 +451,93 @@ class Initiator:
         parsed = json.loads(reply[start : end + 1])
         if not isinstance(parsed, dict):
             return None
-        out = {}
+        out: dict[str, tuple[str, str]] = {}
         for key, val in parsed.items():
-            val = str(val).strip().lower()
-            out[str(key)] = "read" if val == "read" else "modify"
+            if isinstance(val, dict):
+                access = str(val.get("access", "")).strip().lower()
+                cat = str(val.get("category", "")).strip().lower()
+            else:  # older single-word form
+                access = str(val).strip().lower()
+                cat = ""
+            access = "read" if access == "read" else "modify"
+            cat = re.sub(r"[^a-z0-9_-]", "", cat)[:30]
+            out[str(key)] = (access, cat)
         return out
+
+    # -- grant selectors -----------------------------------------------------
+
+    def expand(
+        self, selectors: list, available: set[str]
+    ) -> tuple[set[str], list[str]]:
+        """Resolve grant selectors to tool names.
+
+        Each selector may be an access class ('read'/'write'/'all'), a
+        category or keyword ('assignments', 'quiz', …), 'read:<keyword>' /
+        'write:<keyword>', or an exact tool name. Returns (granted names,
+        selectors that matched nothing).
+        """
+        granted: set[str] = set()
+        unmatched: list[str] = []
+        lower_names = {n.lower(): n for n in available}
+        for raw in selectors or []:
+            sel = str(raw).strip().lower()
+            sel = sel.removesuffix(" tools").strip()
+            if not sel:
+                continue
+            access = None
+            prefix, _, rest = sel.partition(":")
+            if rest.strip() and prefix in ("read", "write", "modify"):
+                access = "read" if prefix == "read" else "modify"
+                sel = rest.strip()
+            matches = self._match(sel, available, lower_names)
+            if access is not None:
+                matches = {n for n in matches if self.classes.get(n) == access}
+            if matches:
+                granted |= matches
+            else:
+                unmatched.append(str(raw))
+        return granted, unmatched
+
+    def _match(
+        self, sel: str, available: set[str], lower_names: dict[str, str]
+    ) -> set[str]:
+        if sel in ("all", "*", "everything"):
+            return set(available)
+        if sel in ("read", "readonly", "read-only", "read_only"):
+            return {n for n in available if self.classes.get(n) == "read"}
+        if sel in ("write", "modify", "mutate"):
+            return {n for n in available if self.classes.get(n) == "modify"}
+        if sel in lower_names:
+            return {lower_names[sel]}
+        out: set[str] = set()
+        for name in available:
+            tags = self.tags.get(name, set())
+            if sel in tags or sel in name.lower():
+                out.add(name)
+            elif len(sel) >= 3 and any(
+                # bidirectional prefix so 'quiz' matches 'quizzes' and back
+                t.startswith(sel) or sel.startswith(t)
+                for t in tags
+                if len(t) >= 3
+            ):
+                out.add(name)
+        return out
+
+    def grant_summary(self) -> str:
+        """One-line description of usable selectors for the manager prompt."""
+        if not self.classes:
+            return ""
+        counts: dict[str, int] = {}
+        for cat in self.category.values():
+            counts[cat] = counts.get(cat, 0) + 1
+        cats = ", ".join(f"'{c}' ({n})" for c, n in sorted(counts.items()))
+        read = sum(1 for c in self.classes.values() if c == "read")
+        return (
+            f"'all' ({len(self.classes)} tools), 'read' ({read}), "
+            f"'write' ({len(self.classes) - read}); categories: {cats}. "
+            "Narrow with 'read:<category>' / 'write:<category>'; exact tool "
+            "names and other keywords from tool names also match."
+        )
 
     def allowed_for(self, agent: str) -> set[str] | None:
         """Tool names an agent may call. None means unrestricted."""
@@ -338,6 +555,7 @@ class Initiator:
             "total": len(self.classes),
             "read": read,
             "modify": len(self.classes) - read,
+            "categories": len(set(self.category.values())),
         }
 
 
@@ -350,7 +568,7 @@ def describe_agents() -> list[dict]:
         "assistant": f"all {info['total']} tools" if info["total"] else "all tools",
         "explorer": f"{info['read']} read-only tools",
         "planner": f"{info['read']} read-only tools + submit_plan",
-        "manager": "delegates via sub-agents",
+        "manager": "run_planner + sub-agents (tools granted by category)",
     }
     return [
         {

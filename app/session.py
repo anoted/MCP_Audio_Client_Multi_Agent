@@ -4,11 +4,14 @@ Multi-agent model:
 - Four primary agents (assistant, explorer, planner, manager), each with its
   own chat history. The active agent handles every user turn; typed input can
   switch agents with a leading @mention, voice always goes to the active agent.
-- planner saves a to-do list via the submit_plan virtual tool; manager works
-  through it by spawning tool-restricted sub-agents (run_subagent) whose
-  activity streams to the client as collapsible cards.
-- Per-agent MCP tool access comes from the Initiator's read/modify
-  classification (agents.initiator).
+- planner saves a to-do list via the submit_plan virtual tool; manager can
+  invoke the planner itself (run_planner) and works through the plan by
+  spawning tool-restricted sub-agents (run_subagent) whose activity streams
+  to the client as collapsible cards.
+- Per-agent MCP tool access comes from the Initiator's read/modify + category
+  classification (agents.initiator); the manager grants sub-agent tools with
+  selectors ('read', 'all', 'assignments', 'write:modules', exact names)
+  expanded by initiator.expand().
 
 Interruption model (barge-in):
 - The whole respond pipeline (sub-agents included) runs as one cancellable
@@ -32,7 +35,9 @@ from . import conversations, llm, speech
 from .agents import (
     AGENTS,
     DEFAULT_AGENT,
+    PLANNER_SUBAGENT_PROMPT,
     SUBAGENT_PROMPT,
+    SUBMIT_PLAN_SPEC,
     describe_agents,
     dynamic_context,
     initiator,
@@ -507,24 +512,44 @@ class VoiceSession:
             return f"Step {index + 1} marked {status}."
         if name == "run_subagent":
             return await self._run_subagent(args, gen)
+        if name == "run_planner":
+            return await self._run_subagent(args, gen, planner=True)
         return f"Unknown virtual tool '{name}'."
 
     # -- sub-agents --------------------------------------------------------------------
 
-    async def _run_subagent(self, args: dict, gen: int) -> str:
+    async def _run_subagent(self, args: dict, gen: int, planner: bool = False) -> str:
         self._sub_seq += 1
         sub_id = f"sub-{gen}-{self._sub_seq}"
-        name = str(args.get("name") or f"subagent-{self._sub_seq}").strip()[:40]
-        instruction = str(args.get("instruction") or "").strip()
-        requested = args.get("tools") if isinstance(args.get("tools"), list) else []
-        if not instruction:
-            return "run_subagent failed: 'instruction' is required."
-
-        all_specs = self.mcp.openai_tools()
-        available = {s["function"]["name"] for s in all_specs}
-        granted = [str(t) for t in requested if str(t) in available]
-        unknown = [str(t) for t in requested if str(t) not in available]
-        specs = self.mcp.openai_tools(set(granted))
+        available = {s["function"]["name"] for s in self.mcp.openai_tools()}
+        if planner:
+            # Manager-invoked planner run: read-only tools + submit_plan.
+            name = "planner"
+            instruction = str(args.get("task") or "").strip()
+            if not instruction:
+                return "run_planner failed: 'task' is required."
+            granted_set, unmatched = initiator.expand(["read"], available)
+            unmatched = []  # no tools at all is fine — planning can be pure reasoning
+        else:
+            name = str(args.get("name") or f"subagent-{self._sub_seq}").strip()[:40]
+            instruction = str(args.get("instruction") or "").strip()
+            if not instruction:
+                return "run_subagent failed: 'instruction' is required."
+            requested = (
+                args.get("tools") if isinstance(args.get("tools"), list) else []
+            )
+            granted_set, unmatched = initiator.expand(requested, available)
+            if requested and not granted_set:
+                return (
+                    "run_subagent failed: no tools matched "
+                    f"{', '.join(repr(u) for u in unmatched)}. Grant access "
+                    "classes ('read', 'write', 'all'), categories/keywords "
+                    "from the tool inventory, or exact tool names."
+                )
+        granted = sorted(granted_set)
+        specs = self.mcp.openai_tools(granted_set)
+        if planner:
+            specs = specs + [SUBMIT_PLAN_SPEC]
 
         entry = {
             "kind": "subagent",
@@ -549,7 +574,12 @@ class VoiceSession:
         )
 
         messages: list[dict] = [
-            {"role": "system", "content": SUBAGENT_PROMPT.format(name=name)},
+            {
+                "role": "system",
+                "content": PLANNER_SUBAGENT_PROMPT
+                if planner
+                else SUBAGENT_PROMPT.format(name=name),
+            },
             {"role": "user", "content": instruction},
         ]
         final = ""
@@ -603,7 +633,15 @@ class VoiceSession:
                             "arguments": tc["arguments"] or "{}",
                         }
                     )
-                    if tc["name"] in set(granted):
+                    if planner and tc["name"] == "submit_plan":
+                        plan_result = await self._virtual_tool(
+                            "submit_plan", arguments, gen
+                        )
+                        outcome = {
+                            "ok": not plan_result.startswith("submit_plan failed"),
+                            "result": plan_result,
+                        }
+                    elif tc["name"] in granted_set:
                         outcome = await self.mcp.call(tc["name"], arguments)
                     else:
                         outcome = {
@@ -656,7 +694,20 @@ class VoiceSession:
             {"type": "subagent_done", "id": sub_id, "ok": True,
              "result": entry["result"]}
         )
-        note = f" (ignored unknown tools: {', '.join(unknown)})" if unknown else ""
+        note = (
+            f" (selectors that matched no tools: {', '.join(unmatched)})"
+            if unmatched
+            else ""
+        )
+        if planner:
+            plan = "\n".join(
+                f"{i}. [{t['status']}] {t['text']}"
+                for i, t in enumerate(self.todos, 1)
+            ) or "(no plan was submitted)"
+            return (
+                f"Planner finished:\n{final[:MAX_SUBAGENT_REPORT]}\n\n"
+                f"Current plan:\n{plan}"
+            )
         return f"Sub-agent '{name}' finished{note}:\n{final[:MAX_SUBAGENT_REPORT]}"
 
     # -- TTS ---------------------------------------------------------------------------

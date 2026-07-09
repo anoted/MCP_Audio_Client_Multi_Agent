@@ -34,26 +34,36 @@ Browser ──16 kHz PCM──▶ FastAPI ──▶ Parakeet ASR (NIM, gRPC)
 | `@assistant` | all | default conversational agent |
 | `@explorer` | read-only | investigates and reports, never modifies |
 | `@planner` | read-only + `submit_plan` | breaks a task into a to-do list (shown in the **Plan** panel) |
-| `@manager` | `run_subagent`, `set_todo_status` | works through the plan by deploying sub-agents |
+| `@manager` | `run_planner`, `run_subagent`, `set_todo_status` | plans via the planner, then works through the plan by deploying sub-agents |
 | *initiator* | — | one-shot background agent |
 
 - **Initiator** runs once at startup (and again whenever the MCP tool inventory
-  changes): it classifies every tool as *read* or *modify* — with the LLM,
-  falling back to a keyword heuristic — assigns tool sets to the agents above,
-  and discards its working context. Its status is shown in the **Agents** panel.
+  changes): it classifies every tool's **access** (*read* or *modify*) and its
+  **category/keywords** (e.g. `assignments`, `modules`, `quizzes`) — with the
+  LLM, falling back to a keyword heuristic on the tool names — assigns tool
+  sets to the agents above, and discards its working context. Its status is
+  shown in the **Agents** panel.
 - **Switching agents**: type `@explorer`, `@planner` (`@plan`), `@manager` or
   `@assistant` in the text field — an autocomplete popup appears at `@` — or
   click an agent in the sidebar. A bare mention just switches; a mention plus
   text switches and sends. **Voice always goes to the active agent** (no voice
   commands to complicate audio). Each agent keeps its own conversation history.
 - **Sub-agents**: the manager creates each one with a name, a self-contained
-  instruction, and an explicit tool allowlist (it only sees those tools). Its
-  streamed output, tool calls and final report render in a collapsible 🤖 card
-  in the chat; the card auto-collapses when the sub-agent finishes.
+  instruction, and **tool grants by selector** — `read` (every read-only
+  tool), `write`, `all`, a category/keyword like `assignments` or `modules`,
+  `read:<category>` / `write:<category>` to narrow, or exact tool names. The
+  initiator's classification expands selectors to the actual tool list, so
+  sub-agents get a whole capability (e.g. all 8 module tools) instead of one
+  or two hand-picked tools. Streamed output, tool calls and the final report
+  render in a collapsible 🤖 card; the card auto-collapses when done.
+- **Manager plans itself**: with `run_planner` the manager launches the
+  planner (read-only tools + `submit_plan`) in the background and the
+  resulting plan lands in the Plan panel — no need to visit `@planner` first.
 
-Typical flow: *"@planner set up X"* → plan appears in the Plan panel →
-*"@manager go"* → manager marks steps in-progress, runs sub-agents, ticks
-steps off.
+Typical flow: *"@manager set up X"* → manager calls `run_planner` → plan
+appears in the Plan panel → manager marks steps in-progress, runs sub-agents
+with category grants, ticks steps off. (Running `@planner` manually first
+still works.)
 
 ## Setup
 
@@ -125,6 +135,21 @@ stdio server ships in `examples/demo_mcp_server.py`:
 Then ask by voice: *"what time is it?"* or *"roll three dice"* — the tool call
 and its result render as a card in the conversation.
 
+### Canvas MCP
+
+`examples/Canvas_MCP/` is a self-contained Canvas LMS MCP server (~31 tools:
+assignments, submissions/grading, quizzes, modules, pages, files,
+announcements). `mcp_servers.json` registers it over stdio through the
+`mcpagents` conda env:
+
+> name `Canvas` · transport `stdio` · command
+> `conda run --no-capture-output -n mcpagents python examples/Canvas_MCP/canvas_mcp_server.py`
+
+Its `CANVAS_BASE_URL` / `CANVAS_API_TOKEN` live in `examples/Canvas_MCP/.env`
+(loaded by the server itself). **The tools operate on a live Canvas instance**
+— see `scenarios/canvas_agents_scenario.md` for a guided multi-agent test
+scenario and which phases are safe outside a sandbox course.
+
 REST API: `GET/POST /api/mcp/servers`, `DELETE /api/mcp/servers/{name}`,
 `POST /api/mcp/servers/{name}/reconnect`, plus `GET /api/agents`,
 `POST /api/model`, `GET/DELETE /api/conversations`.
@@ -134,11 +159,12 @@ REST API: `GET/POST /api/mcp/servers`, `DELETE /api/mcp/servers/{name}`,
 ```
 app/main.py          FastAPI app, WebSocket, REST (MCP, agents, model, conversations)
 app/session.py       per-connection multi-agent pipeline + interruption handling
-app/agents.py        agent profiles, virtual tools, Initiator (tool classifier)
+app/agents.py        agent profiles, virtual tools, Initiator (access + category classifier, grant selectors)
 app/conversations.py save/load conversations (one JSON file each)
 app/speech.py        Riva NIM ASR/TTS (Parakeet, Magpie)
 app/llm.py           OpenAI-compatible streaming client + sentence splitter
 app/mcp_manager.py   MCP registration, connections, tool routing
 static/              browser UI (VAD, playback, chat, agents/plan/MCP panels)
-examples/            demo stdio MCP server
+examples/            demo stdio MCP server + Canvas_MCP (separate sub-project)
+scenarios/           guided test scenarios (Canvas multi-agent run)
 ```
