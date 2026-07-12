@@ -1,54 +1,88 @@
-/* Voice Client frontend.
+/* Voice Workflow Client frontend.
  *
- * Mic audio -> AudioWorklet (16 kHz Int16 chunks) -> energy VAD here ->
- * WebSocket binary frames to the server. Assistant TTS comes back as raw
- * PCM16 binary frames scheduled into an AudioContext. Speaking while audio
- * is playing (or the model is thinking) triggers barge-in: playback stops
- * instantly and the server cancels LLM + TTS generation.
+ * Audio path (self-interruption fix):
+ *   Mic -> AudioWorklet (16 kHz Int16) -> adaptive VAD here -> WebSocket.
+ *   TTS PCM is scheduled into an AudioContext whose output is routed through
+ *   a MediaStreamDestination into a hidden <audio> element — audio played via
+ *   a media element is part of the browser's echo-cancellation reference, so
+ *   speaker output is subtracted from the mic signal (raw WebAudio output is
+ *   not, which is why the old build interrupted itself on speakers).
+ *   On top of AEC, a software gate compares mic energy against the *known*
+ *   playback envelope with an adaptive coupling estimate, and barge-in while
+ *   the assistant speaks requires sustained speech (~0.3 s), like current
+ *   voice assistants. "Manual" mode disables auto barge-in entirely (⏹/Esc).
  *
- * Multi-agent UI: @agent mentions in the text field switch the active agent
- * (voice always talks to the active one); sub-agents spawned by the manager
- * stream into collapsible cards inside the chat.
+ * Workflow UI: plan approval, per-step review/verify badges, human approval
+ * cards for risky tool calls, skill selection, MCP app iframes (course
+ * explorer / charts) with a read-only tool bridge and workflow-context chips,
+ * live activity log, and a settings overlay (X top-right).
  */
 "use strict";
 
 // ---------------------------------------------------------------------------
+// Tunables
+// ---------------------------------------------------------------------------
+const CHUNK_MS = 32;               // worklet chunk duration (512 samples @16 kHz)
+const VAD_BASE = 0.012;            // baseline RMS threshold for speech
+const VAD_ATTACK_CHUNKS = 2;       // voiced chunks to open capture (idle)
+const BARGE_ATTACK_CHUNKS = 9;     // ~290 ms of sustained speech to barge in
+const VAD_RELEASE_MS = 750;        // trailing silence that closes an utterance
+const PREROLL_CHUNKS = 10;         // ~320 ms sent retroactively at speech start
+const ECHO_MARGIN = 2.3;           // mic must exceed est. echo by this factor
+const INTERRUPT_COOLDOWN_MS = 600; // ignore VAD right after an interrupt
+
+// ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-const CHUNK_MS = 32;              // worklet chunk duration (512 samples @16 kHz)
-const VAD_THRESHOLD = 0.015;      // RMS threshold for speech
-const BARGE_IN_FACTOR = 2.2;      // stricter threshold while TTS is playing
-const VAD_ATTACK_CHUNKS = 2;      // consecutive voiced chunks to open capture
-const VAD_RELEASE_MS = 750;       // trailing silence that closes an utterance
-const PREROLL_CHUNKS = 8;         // ~250 ms sent retroactively at speech start
-
 let ws = null;
 let wsReady = false;
-let serverState = "connecting";   // listening | transcribing | thinking | speaking
+let serverState = "connecting";    // listening | transcribing | thinking | speaking
+let cfg = {};                      // last /api/config-shaped payload
 let ttsSampleRate = 22050;
 
 let micCtx = null, micStream = null, micLive = false;
 let capturing = false, voicedRun = 0, silenceMs = 0;
 let preroll = [];
+let noiseFloor = 0.004;            // adaptive ambient noise estimate
+let calibrating = 0;               // chunks left in initial calibration
+let calibSamples = [];
+let echoGain = 1.5;                // adaptive speaker->mic coupling estimate
+let interruptCooldownUntil = 0;
 
-let playCtx = null, nextPlayTime = 0;
+let playCtx = null, playDest = null, nextPlayTime = 0;
 const activeSources = new Set();
+const playbackSegs = [];           // {start, end (wall ms), rms}
 
-let currentAssistantEl = null;    // streaming bubble
-let currentAgent = "assistant";   // active agent
-let streamingAgent = "assistant"; // agent of the bubble being streamed
-let agents = [];                  // [{name, description, access}]
-let lastVoice = "";               // TTS voice string for the header line
-const toolCards = new Map();      // tool_call id -> element
-const subCards = new Map();       // subagent id -> {card, textEl, body, calls: Map}
+let currentAssistantEl = null;
+let currentAgent = "manager";
+let streamingAgent = "manager";
+let agents = [];
+let skills = [];
+let workflowState = { stage: "idle", task: "", skill: null, todos: [] };
+let wfChips = [];                  // [{label, text}] context for the next message
+const toolCards = new Map();
+const subCards = new Map();
+const approvalCards = new Map();
+const appCards = new Map();
+
+const audioPrefs = loadAudioPrefs();
+
+function loadAudioPrefs() {
+  const def = { mode: "smart", sensitivity: 1.0 };
+  try { return { ...def, ...(JSON.parse(localStorage.getItem("vc-audio") || "{}")) }; }
+  catch { return def; }
+}
+function saveAudioPrefs() {
+  try { localStorage.setItem("vc-audio", JSON.stringify(audioPrefs)); } catch { /* ignore */ }
+}
 
 // ---------------------------------------------------------------------------
 // DOM
 // ---------------------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
 const chatEl = $("chat"), chatWrap = $("chat-wrap");
-const statusPill = $("status-pill"), connDot = $("conn-dot"), modelInfo = $("model-info");
-const micBtn = $("mic-btn"), vadFill = $("vad-fill");
+const statusPill = $("status-pill"), connDot = $("conn-dot"), modelChip = $("model-chip");
+const micBtn = $("mic-btn"), stopBtn = $("stop-btn"), vadFill = $("vad-fill");
 const textInput = $("text-input"), sendBtn = $("send-btn"), resetBtn = $("reset-btn");
 const agentChip = $("active-agent"), agentList = $("agent-list");
 const initiatorStatus = $("initiator-status"), todoList = $("todo-list");
@@ -56,16 +90,23 @@ const mentionPop = $("mention-pop");
 const themeBtn = $("theme-btn");
 const convBtn = $("conv-btn"), convPanel = $("conv-panel");
 const convName = $("conv-name"), convSaveBtn = $("conv-save-btn"), convList = $("conv-list");
-const modelEditBtn = $("model-edit-btn"), modelInput = $("model-input");
+const ttsAudioEl = $("tts-out");
+const activityLog = $("activity-log");
+const wfStageBadge = $("wf-stage-badge"), wfStages = $("wf-stages"), wfTask = $("wf-task");
+const skillSelect = $("skill-select");
+const planApproval = $("plan-approval"), planNote = $("plan-note");
+const wfContextBar = $("wf-context-bar"), wfChipsEl = $("wf-chips");
+const appsSection = $("apps-section"), appsList = $("apps-list");
 
 // ---------------------------------------------------------------------------
-// Theme (light / dark)
+// Theme
 // ---------------------------------------------------------------------------
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
   themeBtn.textContent = theme === "light" ? "🌙" : "☀️";
   themeBtn.title = theme === "light" ? "Switch to dark mode" : "Switch to light mode";
   try { localStorage.setItem("voice-client-theme", theme); } catch { /* private mode */ }
+  broadcastToApps({ mcpApp: true, type: "theme", theme });
 }
 themeBtn.addEventListener("click", () =>
   applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light"));
@@ -73,6 +114,7 @@ applyTheme((() => {
   try { return localStorage.getItem("voice-client-theme") || "dark"; }
   catch { return "dark"; }
 })());
+function currentTheme() { return document.documentElement.dataset.theme || "dark"; }
 
 // ---------------------------------------------------------------------------
 // WebSocket
@@ -81,7 +123,6 @@ function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.binaryType = "arraybuffer";
-
   ws.onopen = () => { wsReady = true; connDot.className = "dot on"; };
   ws.onclose = () => {
     wsReady = false;
@@ -95,104 +136,100 @@ function connect() {
     handleServerEvent(JSON.parse(ev.data));
   };
 }
-
 function send(obj) { if (wsReady) ws.send(JSON.stringify(obj)); }
 
 function handleServerEvent(msg) {
   switch (msg.type) {
     case "config":
+      cfg = msg;
       ttsSampleRate = msg.tts_sample_rate;
-      lastVoice = msg.voice;
-      updateModelInfo(msg.model, msg.speech_enabled);
+      updateModelChip();
       if (msg.agents) { agents = msg.agents; renderAgents(); }
-      setActiveAgent(msg.agent || "assistant", false);
+      if (msg.skills) { skills = msg.skills; renderSkillOptions(); renderSkillsTab(); }
+      setActiveAgent(msg.agent || "manager", false);
+      syncSettingsForm();
       break;
-    case "state":
-      setState(msg.state);
-      break;
-    case "agent_changed":
-      setActiveAgent(msg.agent, true);
-      break;
-    case "transcript":
-      addUserMessage(msg.text);
-      break;
+    case "state": setState(msg.state); break;
+    case "agent_changed": setActiveAgent(msg.agent, true); break;
+    case "transcript": addUserMessage(msg.text); break;
     case "assistant_start":
-      currentAssistantEl = null; // created lazily on first delta
+      currentAssistantEl = null;
       streamingAgent = msg.agent || currentAgent;
       break;
-    case "assistant_delta":
-      appendAssistantText(msg.text);
-      break;
-    case "assistant_done":
-      finalizeAssistant(false);
-      break;
+    case "assistant_delta": appendAssistantText(msg.text); break;
+    case "assistant_done": finalizeAssistant(false); break;
     case "interrupted":
       stopPlayback();
       finalizeAssistant(true);
       interruptSubCards();
+      cancelPendingApprovalCards();
       break;
-    case "tool_call":
-      addToolCard(msg);
+    case "tool_call": addToolCard(msg); break;
+    case "tool_result": completeToolCard(msg); break;
+    case "subagent_start": addSubCard(msg); break;
+    case "subagent_delta": appendSubText(msg); break;
+    case "subagent_tool_call": addSubToolCall(msg); break;
+    case "subagent_tool_result": completeSubToolCall(msg); break;
+    case "subagent_done": finishSubCard(msg); break;
+    case "todos": renderTodos(msg.todos); break;
+    case "workflow": renderWorkflow(msg); break;
+    case "plan_review":
+      renderWorkflow(msg);
+      addNotice("📋 Plan ready — approve or request changes in the Workflow panel (or just say “approve”).");
       break;
-    case "tool_result":
-      completeToolCard(msg);
-      break;
-    case "subagent_start":
-      addSubCard(msg);
-      break;
-    case "subagent_delta":
-      appendSubText(msg);
-      break;
-    case "subagent_tool_call":
-      addSubToolCall(msg);
-      break;
-    case "subagent_tool_result":
-      completeSubToolCall(msg);
-      break;
-    case "subagent_done":
-      finishSubCard(msg);
-      break;
-    case "todos":
-      renderTodos(msg.todos);
-      break;
+    case "approval_request": addApprovalCard(msg); break;
+    case "approval_resolved": resolveApprovalCard(msg); break;
+    case "app": addAppCard(msg); break;
+    case "app_tool_result": routeAppToolResult(msg); break;
+    case "log": addActivity(msg.entry); break;
     case "saved":
       addNotice(`Conversation saved as “${msg.name}”.`);
       refreshConversations();
       break;
     case "loaded":
-      chatEl.innerHTML = "";
-      toolCards.clear();
-      subCards.clear();
-      currentAssistantEl = null;
+      clearChat();
       replayTranscript(msg.transcript || []);
-      renderTodos(msg.todos || []);
-      setActiveAgent(msg.agent || "assistant", false);
+      renderWorkflow(msg.workflow || { stage: "idle", todos: msg.todos || [] });
+      setActiveAgent(msg.agent || "manager", false);
       addNotice(`Loaded conversation “${msg.name}”.`);
       break;
-    case "tts_end":
-      break;
+    case "tts_end": break;
     case "history_reset":
-      chatEl.innerHTML = "";
-      toolCards.clear();
-      subCards.clear();
-      currentAssistantEl = null;
+      clearChat();
+      renderWorkflow({ stage: "idle", task: "", skill: null, todos: [] });
       addNotice("Conversation cleared.");
       break;
-    case "error":
-      addError(msg.message);
-      break;
+    case "error": addError(msg.message); break;
   }
+}
+
+function clearChat() {
+  chatEl.innerHTML = "";
+  toolCards.clear();
+  subCards.clear();
+  approvalCards.clear();
+  appCards.clear();
+  currentAssistantEl = null;
 }
 
 function setState(s) {
   serverState = s;
-  statusPill.textContent = s;
-  statusPill.className = `pill ${s}`;
+  const pending = [...approvalCards.values()].some((c) => c.pending);
+  statusPill.textContent = pending ? "awaiting approval" : s;
+  statusPill.className = `pill ${pending ? "approval" : s}`;
+  const busy = s === "thinking" || s === "speaking" || s === "transcribing";
+  stopBtn.classList.toggle("hidden", !busy);
 }
 
 // ---------------------------------------------------------------------------
 // Agents
 // ---------------------------------------------------------------------------
+const AGENT_ICONS = {
+  manager: "🧭", planner: "🗺️", explorer: "🔭", reviewer: "🔎",
+  verifier: "✅", assistant: "💬",
+};
+const ROLE_ICONS = { worker: "🤖", planner: "🗺️", reviewer: "🔎", verifier: "✅" };
+
 function setActiveAgent(name, announce) {
   const changed = name !== currentAgent;
   currentAgent = name;
@@ -203,17 +240,27 @@ function setActiveAgent(name, announce) {
 
 function renderAgents() {
   agentList.innerHTML = "";
-  for (const a of agents) {
+  const wf = agents.filter((a) => a.workflow !== false);
+  const general = agents.filter((a) => a.workflow === false);
+  const addItem = (a) => {
     const el = document.createElement("div");
     el.className = "agent-item" + (a.name === currentAgent ? " active" : "");
-    el.innerHTML = `<div class="agent-name"></div>
-                    <div class="agent-desc"></div>
-                    <div class="agent-access"></div>`;
+    el.innerHTML = `<span class="agent-ico"></span><div class="agent-txt">
+        <div class="agent-name"></div><div class="agent-desc"></div></div>`;
+    el.querySelector(".agent-ico").textContent = AGENT_ICONS[a.name] || "•";
     el.querySelector(".agent-name").textContent = `@${a.name}`;
     el.querySelector(".agent-desc").textContent = a.description;
-    el.querySelector(".agent-access").textContent = a.access || "";
+    el.title = a.access || "";
     el.addEventListener("click", () => send({ type: "set_agent", agent: a.name }));
     agentList.appendChild(el);
+  };
+  wf.forEach(addItem);
+  if (general.length) {
+    const div = document.createElement("div");
+    div.className = "agent-divider";
+    div.textContent = "outside the workflow";
+    agentList.appendChild(div);
+    general.forEach(addItem);
   }
 }
 
@@ -261,9 +308,7 @@ function updateMentionPop() {
   });
   mentionPop.classList.remove("hidden");
 }
-
 function hideMentionPop() { mentionPop.classList.add("hidden"); mentionItems = []; }
-
 function pickMention(i) {
   const a = mentionItems[i];
   if (!a) return;
@@ -292,7 +337,6 @@ textInput.addEventListener("keydown", (e) => {
   }
   if (e.key === "Enter") sendTyped();
 });
-
 agentChip.addEventListener("click", () => {
   textInput.value = "@";
   textInput.focus();
@@ -312,7 +356,6 @@ function addNotice(text) {
   chatEl.appendChild(el);
   scrollChat();
 }
-
 function addError(text) {
   const el = document.createElement("div");
   el.className = "sys-error";
@@ -320,7 +363,6 @@ function addError(text) {
   chatEl.appendChild(el);
   scrollChat();
 }
-
 function addUserMessage(text) {
   const el = document.createElement("div");
   el.className = "msg user";
@@ -332,19 +374,16 @@ function addUserMessage(text) {
 function newAssistantBubble(agent) {
   const el = document.createElement("div");
   el.className = "msg assistant";
-  if (agent && agent !== "assistant") {
-    const tag = document.createElement("div");
-    tag.className = "agent-tag";
-    tag.textContent = `@${agent}`;
-    el.appendChild(tag);
-  }
+  const tag = document.createElement("div");
+  tag.className = "agent-tag";
+  tag.textContent = `${AGENT_ICONS[agent] || ""} @${agent}`;
+  el.appendChild(tag);
   const body = document.createElement("span");
   body.className = "msg-body";
   el.appendChild(body);
   chatEl.appendChild(el);
   return el;
 }
-
 function appendAssistantText(text) {
   if (!currentAssistantEl) {
     currentAssistantEl = newAssistantBubble(streamingAgent);
@@ -353,7 +392,6 @@ function appendAssistantText(text) {
   currentAssistantEl.querySelector(".msg-body").textContent += text;
   scrollChat();
 }
-
 function finalizeAssistant(interrupted) {
   if (!currentAssistantEl) return;
   currentAssistantEl.classList.remove("streaming");
@@ -365,7 +403,6 @@ function finalizeAssistant(interrupted) {
   }
   currentAssistantEl = null;
 }
-
 function addAssistantFull(agent, text, interrupted) {
   const el = newAssistantBubble(agent);
   el.querySelector(".msg-body").textContent = text;
@@ -386,6 +423,7 @@ function buildToolCard(name, server, args) {
       <span class="tool-icon">🔧</span>
       <span class="tool-name"></span>
       <span class="tool-server"></span>
+      <span class="tool-flag hidden" title="Injection guard flagged this result">⚠️</span>
       <span class="tool-status">running…</span>
     </div>
     <div class="tool-body">
@@ -403,39 +441,40 @@ function buildToolCard(name, server, args) {
     card.classList.toggle("open"));
   return card;
 }
-
-function settleToolCard(card, ok, result) {
+function settleToolCard(card, ok, result, flags) {
   card.classList.add(ok ? "done" : "failed");
   card.querySelector(".tool-status").textContent = ok ? "done" : "failed";
   card.querySelector(".result").textContent = result;
+  if (flags && flags.length) {
+    const f = card.querySelector(".tool-flag");
+    f.classList.remove("hidden");
+    f.title = `Injection guard: ${flags.join(", ")}`;
+  }
 }
-
 function addToolCard(msg) {
-  // A tool call ends the current text bubble segment.
   finalizeAssistant(false);
   const card = buildToolCard(msg.tool, msg.server, msg.arguments);
   chatEl.appendChild(card);
   toolCards.set(msg.id, card);
   scrollChat();
 }
-
 function completeToolCard(msg) {
   const card = toolCards.get(msg.id);
   if (!card) return;
-  settleToolCard(card, msg.ok, msg.result);
+  settleToolCard(card, msg.ok, msg.result, msg.flags);
   scrollChat();
 }
 
-// ---- sub-agent cards (collapsible) -----------------------------------------
-function buildSubCard(id, name, task, tools) {
+// ---- sub-agent cards --------------------------------------------------------
+function buildSubCard(id, name, task, tools, role) {
   const card = document.createElement("div");
-  card.className = "sub-card open";
+  card.className = `sub-card open role-${role || "worker"}`;
   card.innerHTML = `
     <div class="sub-head">
       <span class="sub-caret">▾</span>
-      <span class="sub-icon">🤖</span>
+      <span class="sub-icon"></span>
       <span class="sub-name"></span>
-      <span class="sub-hint">sub-agent</span>
+      <span class="sub-hint"></span>
       <span class="sub-status">running…</span>
     </div>
     <div class="sub-body">
@@ -445,7 +484,9 @@ function buildSubCard(id, name, task, tools) {
       <div class="sub-tools"></div>
       <div class="sub-text"></div>
     </div>`;
+  card.querySelector(".sub-icon").textContent = ROLE_ICONS[role] || "🤖";
   card.querySelector(".sub-name").textContent = name;
+  card.querySelector(".sub-hint").textContent = role || "sub-agent";
   card.querySelector(".sub-task").textContent = task;
   const toolsEl = card.querySelector(".sub-tools");
   if (tools && tools.length) {
@@ -465,10 +506,9 @@ function buildSubCard(id, name, task, tools) {
   });
   return card;
 }
-
 function addSubCard(msg) {
   finalizeAssistant(false);
-  const card = buildSubCard(msg.id, msg.name, msg.task, msg.tools);
+  const card = buildSubCard(msg.id, msg.name, msg.task, msg.tools, msg.role);
   chatEl.appendChild(card);
   subCards.set(msg.id, {
     card,
@@ -478,14 +518,12 @@ function addSubCard(msg) {
   });
   scrollChat();
 }
-
 function appendSubText(msg) {
   const sub = subCards.get(msg.id);
   if (!sub) return;
   sub.textEl.textContent += msg.text;
   scrollChat();
 }
-
 function addSubToolCall(msg) {
   const sub = subCards.get(msg.id);
   if (!sub) return;
@@ -500,36 +538,35 @@ function addSubToolCall(msg) {
   det.querySelector(".st-args").textContent = pretty;
   sub.body.appendChild(det);
   sub.calls.set(msg.call_id, det);
-  // Fresh text element so post-tool deltas appear below the tool line.
   sub.textEl = document.createElement("div");
   sub.textEl.className = "sub-text";
   sub.body.appendChild(sub.textEl);
   scrollChat();
 }
-
 function completeSubToolCall(msg) {
   const sub = subCards.get(msg.id);
   if (!sub) return;
   const det = sub.calls.get(msg.call_id);
   if (!det) return;
-  det.querySelector(".st-status").textContent = msg.ok ? "done" : "failed";
+  det.querySelector(".st-status").textContent =
+    (msg.ok ? "done" : "failed") + (msg.flags && msg.flags.length ? " ⚠️" : "");
   det.classList.add(msg.ok ? "done" : "failed");
   det.querySelector(".st-result").textContent = msg.result;
   scrollChat();
 }
-
 function finishSubCard(msg) {
   const sub = subCards.get(msg.id);
   if (!sub) return;
   const status = sub.card.querySelector(".sub-status");
-  status.textContent = msg.ok ? "✓ done" : "✗ failed";
-  sub.card.classList.add(msg.ok ? "done" : "failed");
-  // Auto-collapse when finished; the head still shows the outcome.
+  let label = msg.ok ? "✓ done" : "✗ failed";
+  if (msg.ok && /^\s*PASS/i.test(msg.result)) label = "✓ PASS";
+  else if (msg.ok && /^\s*FAIL/i.test(msg.result)) label = "✗ FAIL";
+  status.textContent = label;
+  sub.card.classList.add(msg.ok && !/^\s*FAIL/i.test(msg.result) ? "done" : "failed");
   sub.card.classList.remove("open");
   sub.card.querySelector(".sub-caret").textContent = "▸";
   scrollChat();
 }
-
 function interruptSubCards() {
   for (const sub of subCards.values()) {
     const status = sub.card.querySelector(".sub-status");
@@ -539,14 +576,12 @@ function interruptSubCards() {
     }
   }
 }
-
 function addSubagentFull(e) {
-  const card = buildSubCard(e.id, e.name, e.task, e.tools);
+  const card = buildSubCard(e.id, e.name, e.task, e.tools, e.role);
   card.classList.remove("open");
   card.querySelector(".sub-caret").textContent = "▸";
   const body = card.querySelector(".sub-body");
-  const textEl = card.querySelector(".sub-text");
-  textEl.textContent = e.text || "";
+  card.querySelector(".sub-text").textContent = e.text || "";
   for (const ev of e.events || []) {
     const det = document.createElement("details");
     det.className = "sub-tool " + (ev.ok ? "done" : "failed");
@@ -566,39 +601,348 @@ function addSubagentFull(e) {
   chatEl.appendChild(card);
 }
 
-// ---- transcript replay (conversation load) ---------------------------------
+// ---- approval cards ---------------------------------------------------------
+function buildApprovalCard(msg, resolved) {
+  const card = document.createElement("div");
+  card.className = "approval-card" + (msg.risk === "high" ? " high" : "");
+  card.innerHTML = `
+    <div class="ap-head">
+      <span class="ap-icon">🛡️</span>
+      <span class="ap-title">Approval needed</span>
+      <span class="ap-risk"></span>
+      <span class="ap-status"></span>
+    </div>
+    <div class="ap-body">
+      <div class="ap-line"><b class="ap-tool"></b> <span class="ap-via"></span></div>
+      <pre class="ap-args"></pre>
+      <div class="ap-controls">
+        <input class="ap-note" placeholder="optional note">
+        <button class="ap-approve primary">✓ Approve</button>
+        <button class="ap-deny danger-ghost">✗ Deny</button>
+      </div>
+    </div>`;
+  card.querySelector(".ap-risk").textContent =
+    msg.risk === "high" ? "high risk" : "write";
+  card.querySelector(".ap-tool").textContent = msg.tool;
+  card.querySelector(".ap-via").textContent =
+    `on ${msg.server} · requested by ${msg.caller}`;
+  card.querySelector(".ap-args").textContent = msg.arguments || "{}";
+  if (!resolved) {
+    card.querySelector(".ap-approve").addEventListener("click", () => {
+      send({ type: "approval", id: msg.id, approved: true,
+             note: card.querySelector(".ap-note").value.trim() });
+    });
+    card.querySelector(".ap-deny").addEventListener("click", () => {
+      send({ type: "approval", id: msg.id, approved: false,
+             note: card.querySelector(".ap-note").value.trim() });
+    });
+  }
+  return card;
+}
+function addApprovalCard(msg) {
+  finalizeAssistant(false);
+  const card = buildApprovalCard(msg, false);
+  chatEl.appendChild(card);
+  approvalCards.set(msg.id, { card, pending: true });
+  setState(serverState); // refresh pill -> "awaiting approval"
+  scrollChat();
+}
+function settleApprovalCard(entry, approved, note) {
+  entry.pending = false;
+  const card = entry.card;
+  card.classList.add(approved ? "approved" : "denied");
+  card.querySelector(".ap-status").textContent =
+    approved ? "✓ approved" : "✗ denied";
+  const ctl = card.querySelector(".ap-controls");
+  ctl.innerHTML = note ? `<span class="ap-notetxt">note: </span>` : "";
+  if (note) ctl.querySelector(".ap-notetxt").append(note);
+}
+function resolveApprovalCard(msg) {
+  const entry = approvalCards.get(msg.id);
+  if (!entry) return;
+  settleApprovalCard(entry, msg.approved, msg.note);
+  setState(serverState);
+  scrollChat();
+}
+function cancelPendingApprovalCards() {
+  for (const entry of approvalCards.values()) {
+    if (entry.pending) settleApprovalCard(entry, false, "cancelled by interruption");
+  }
+  setState(serverState);
+}
+function addApprovalFull(e) {
+  const card = buildApprovalCard(e, true);
+  const entry = { card, pending: false };
+  if (e.approved !== null && e.approved !== undefined) {
+    settleApprovalCard(entry, e.approved, e.note);
+  } else {
+    settleApprovalCard(entry, false, "unresolved");
+  }
+  chatEl.appendChild(card);
+}
+
+// ---- MCP app cards (sandboxed iframes + bridge) -------------------------------
+function addAppCard(msg) {
+  finalizeAssistant(false);
+  const card = document.createElement("div");
+  card.className = "app-card";
+  card.innerHTML = `
+    <div class="app-head">
+      <span class="app-icon">🧩</span>
+      <span class="app-title"></span>
+      <span class="app-server"></span>
+      <button class="app-max ghost tiny" title="Expand">⤢</button>
+      <button class="app-toggle ghost tiny" title="Collapse">▾</button>
+    </div>`;
+  card.querySelector(".app-title").textContent = msg.title;
+  card.querySelector(".app-server").textContent = `via ${msg.server}`;
+  const iframe = document.createElement("iframe");
+  iframe.className = "app-frame";
+  iframe.setAttribute("sandbox", "allow-scripts");
+  iframe.srcdoc = msg.html;
+  card.appendChild(iframe);
+  card.querySelector(".app-toggle").addEventListener("click", (e) => {
+    card.classList.toggle("collapsed");
+    e.target.textContent = card.classList.contains("collapsed") ? "▸" : "▾";
+  });
+  card.querySelector(".app-max").addEventListener("click", () => {
+    card.classList.toggle("maxed");
+  });
+  chatEl.appendChild(card);
+  appCards.set(msg.id, { iframe, server: msg.server, data: msg.data, inited: false });
+  scrollChat();
+}
+
+window.addEventListener("message", (e) => {
+  const m = e.data;
+  if (!m || !m.mcpApp) return;
+  let appId = null, entry = null;
+  for (const [id, en] of appCards) {
+    if (en.iframe.contentWindow === e.source) { appId = id; entry = en; break; }
+  }
+  if (!entry) return;
+  switch (m.type) {
+    case "ready":
+      entry.iframe.contentWindow.postMessage(
+        { mcpApp: true, type: "init", data: entry.data, theme: currentTheme() }, "*");
+      entry.inited = true;
+      break;
+    case "tool_call":
+      send({
+        type: "app_tool_call",
+        server: entry.server,
+        tool: String(m.tool || ""),
+        args: m.args && typeof m.args === "object" ? m.args : {},
+        req_id: `${appId}#${m.req_id}`,
+      });
+      break;
+    case "workflow_add":
+      addWfChip(String(m.label || "item").slice(0, 60), String(m.text || "").slice(0, 1500));
+      send({ type: "app_workflow_add", text: String(m.text || "").slice(0, 1500) });
+      break;
+    case "insert_input":
+      textInput.value = String(m.text || "").slice(0, 1000);
+      textInput.focus();
+      break;
+    case "resize": {
+      const h = Math.max(140, Math.min(680, Number(m.height) || 300));
+      entry.iframe.style.height = `${h}px`;
+      break;
+    }
+  }
+});
+function routeAppToolResult(msg) {
+  const [appId, rid] = String(msg.req_id || "").split("#");
+  const entry = appCards.get(appId);
+  if (!entry || !rid) return;
+  entry.iframe.contentWindow.postMessage(
+    { mcpApp: true, type: "tool_result", req_id: rid, ok: msg.ok, result: msg.result },
+    "*");
+}
+function broadcastToApps(payload) {
+  for (const entry of appCards.values()) {
+    if (entry.inited) entry.iframe.contentWindow.postMessage(payload, "*");
+  }
+}
+
+// ---- transcript replay --------------------------------------------------------
 function replayTranscript(events) {
   for (const e of events) {
     if (e.kind === "user") addUserMessage(e.text);
     else if (e.kind === "assistant") addAssistantFull(e.agent, e.text, e.interrupted);
     else if (e.kind === "tool") {
       const card = buildToolCard(e.tool || e.name, e.server, e.arguments);
-      settleToolCard(card, e.ok, e.result || "");
+      settleToolCard(card, e.ok, e.result || "", e.flags);
       chatEl.appendChild(card);
     } else if (e.kind === "subagent") addSubagentFull(e);
+    else if (e.kind === "approval") addApprovalFull(e);
+    else if (e.kind === "app") addAppCard(e);
   }
   scrollChat();
 }
 
 // ---------------------------------------------------------------------------
-// Plan / to-do list panel
+// Workflow panel
 // ---------------------------------------------------------------------------
+const STAGE_ORDER = ["planning", "plan_review", "executing", "complete"];
+
+function renderWorkflow(wf) {
+  workflowState = { ...workflowState, ...wf };
+  const stage = workflowState.stage || "idle";
+  wfStageBadge.textContent = stage.replace("_", " ");
+  wfStageBadge.className = `badge stage-${stage}`;
+  const reached = STAGE_ORDER.indexOf(stage);
+  wfStages.querySelectorAll("span").forEach((el) => {
+    const idx = STAGE_ORDER.indexOf(el.dataset.stage);
+    el.classList.toggle("on", idx === reached);
+    el.classList.toggle("past", reached > idx || stage === "complete");
+  });
+  if (workflowState.task) {
+    wfTask.textContent = workflowState.task;
+    wfTask.classList.remove("hidden");
+    wfTask.title = workflowState.task;
+  } else {
+    wfTask.classList.add("hidden");
+  }
+  skillSelect.value = workflowState.skill || "";
+  planApproval.classList.toggle("hidden", stage !== "plan_review");
+  if (wf.todos) renderTodos(wf.todos);
+}
+
 function renderTodos(todos) {
+  workflowState.todos = todos || [];
   todoList.innerHTML = "";
   if (!todos || !todos.length) {
     todoList.innerHTML =
-      `<div class="side-empty">No plan yet — ask <b>@planner</b> for one.</div>`;
+      `<div class="side-empty">No plan yet — just say what you need.</div>`;
     return;
   }
   todos.forEach((t, i) => {
     const el = document.createElement("div");
     el.className = `todo-item ${t.status}`;
     const icon = t.status === "done" ? "✓" : t.status === "in_progress" ? "▶" : "○";
-    el.innerHTML = `<span class="todo-icon"></span><span class="todo-text"></span>`;
+    el.innerHTML = `<span class="todo-icon"></span>
+      <span class="todo-text"></span><span class="todo-badges"></span>`;
     el.querySelector(".todo-icon").textContent = icon;
     el.querySelector(".todo-text").textContent = `${i + 1}. ${t.text}`;
+    const badges = el.querySelector(".todo-badges");
+    const addBadge = (cls, txt, title) => {
+      const b = document.createElement("span");
+      b.className = `tb ${cls}`;
+      b.textContent = txt;
+      b.title = title;
+      badges.appendChild(b);
+    };
+    if (t.wrote) addBadge("wrote", "✎", "This step modified state");
+    if (t.review) addBadge(t.review === "pass" ? "ok" : "bad",
+      `R${t.review === "pass" ? "✓" : "✗"}`, `Reviewer: ${t.review}`);
+    if (t.verify) addBadge(t.verify === "pass" ? "ok" : "bad",
+      `V${t.verify === "pass" ? "✓" : "✗"}`, `Verifier: ${t.verify}`);
     todoList.appendChild(el);
   });
+}
+
+$("plan-approve").addEventListener("click", () => {
+  send({ type: "plan_decision", approved: true, note: planNote.value.trim() });
+  planNote.value = "";
+});
+$("plan-reject").addEventListener("click", () => {
+  send({ type: "plan_decision", approved: false, note: planNote.value.trim() });
+  planNote.value = "";
+});
+
+function renderSkillOptions() {
+  const current = skillSelect.value;
+  skillSelect.innerHTML = `<option value="">auto / none</option>`;
+  for (const s of skills) {
+    const opt = document.createElement("option");
+    opt.value = s.name;
+    opt.textContent = s.title || s.name;
+    skillSelect.appendChild(opt);
+  }
+  skillSelect.value = workflowState.skill || current || "";
+}
+skillSelect.addEventListener("change", () =>
+  send({ type: "set_skill", name: skillSelect.value }));
+
+// ---------------------------------------------------------------------------
+// Activity log
+// ---------------------------------------------------------------------------
+const ACTIVITY_MAX = 250;
+function addActivity(entry) {
+  if (!entry) return;
+  const el = document.createElement("div");
+  el.className = `act-line act-${entry.kind}`;
+  const detail = Object.entries(entry)
+    .filter(([k]) => !["ts", "t", "kind"].includes(k))
+    .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
+    .join(" ")
+    .slice(0, 220);
+  el.innerHTML = `<span class="act-ts"></span><span class="act-kind"></span><span class="act-detail"></span>`;
+  el.querySelector(".act-ts").textContent = entry.ts || "";
+  el.querySelector(".act-kind").textContent = entry.kind;
+  el.querySelector(".act-detail").textContent = detail;
+  const atBottom =
+    activityLog.scrollHeight - activityLog.scrollTop - activityLog.clientHeight < 40;
+  activityLog.appendChild(el);
+  while (activityLog.children.length > ACTIVITY_MAX) {
+    activityLog.removeChild(activityLog.firstChild);
+  }
+  if (atBottom) activityLog.scrollTop = activityLog.scrollHeight;
+}
+$("activity-clear").addEventListener("click", () => { activityLog.innerHTML = ""; });
+
+// ---------------------------------------------------------------------------
+// Workflow context chips (data pushed from MCP apps)
+// ---------------------------------------------------------------------------
+function addWfChip(label, text) {
+  wfChips.push({ label, text });
+  renderWfChips();
+}
+function renderWfChips() {
+  wfChipsEl.innerHTML = "";
+  wfContextBar.classList.toggle("hidden", !wfChips.length);
+  wfChips.forEach((c, i) => {
+    const chip = document.createElement("span");
+    chip.className = "wf-chip";
+    chip.title = c.text;
+    chip.innerHTML = `<span class="wfc-txt"></span><button class="wfc-x">✕</button>`;
+    chip.querySelector(".wfc-txt").textContent = c.label;
+    chip.querySelector(".wfc-x").addEventListener("click", () => {
+      wfChips.splice(i, 1);
+      renderWfChips();
+    });
+    wfChipsEl.appendChild(chip);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Apps panel
+// ---------------------------------------------------------------------------
+async function refreshApps() {
+  try {
+    const res = await fetch("/api/apps");
+    const data = await res.json();
+    renderApps(data.apps || []);
+  } catch { /* server restarting */ }
+}
+function renderApps(apps) {
+  appsSection.classList.toggle("hidden", !apps.length);
+  appsList.innerHTML = "";
+  for (const a of apps) {
+    const el = document.createElement("div");
+    el.className = "app-entry";
+    el.innerHTML = `<span class="app-icon">🧩</span><div class="app-txt">
+        <div class="app-name"></div><div class="app-desc"></div></div>
+        <button class="ghost tiny">Open</button>`;
+    el.querySelector(".app-name").textContent =
+      a.tool.replace(/^open_/, "").replace(/_/g, " ");
+    el.querySelector(".app-desc").textContent = `${a.server}`;
+    el.title = a.description || "";
+    el.querySelector("button").addEventListener("click", () =>
+      send({ type: "open_app", server: a.server, tool: a.tool }));
+    appsList.appendChild(el);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -614,19 +958,16 @@ document.addEventListener("click", (e) => {
     convPanel.classList.add("hidden");
   }
 });
-
 convSaveBtn.addEventListener("click", () => {
   send({ type: "save", name: convName.value.trim() });
   convName.value = "";
 });
-
 async function refreshConversations() {
   try {
     const res = await fetch("/api/conversations");
     renderConversations(await res.json());
   } catch { /* server restarting */ }
 }
-
 function renderConversations(items) {
   convList.innerHTML = "";
   if (!items.length) {
@@ -660,67 +1001,259 @@ function renderConversations(items) {
 }
 
 // ---------------------------------------------------------------------------
-// Model switch
+// Settings overlay
 // ---------------------------------------------------------------------------
-function updateModelInfo(model, speechEnabled) {
-  modelInfo.textContent = `${model} · ${lastVoice}` +
-    (speechEnabled ? "" : " · ⚠ speech not configured");
-  modelInfo.dataset.model = model;
-  modelInfo.dataset.speech = speechEnabled ? "1" : "";
-}
+const settingsOverlay = $("settings-overlay");
+const settingsBtn = $("settings-btn");
 
-modelEditBtn.addEventListener("click", () => {
-  modelInput.value = modelInfo.dataset.model || "";
-  modelInfo.classList.add("hidden");
-  modelEditBtn.classList.add("hidden");
-  modelInput.classList.remove("hidden");
-  modelInput.focus();
-  modelInput.select();
+function openSettings(tab) {
+  settingsOverlay.classList.remove("hidden");
+  if (tab) switchTab(tab);
+  refreshServers();
+  refreshLogList();
+  updateAudioDiag();
+}
+function closeSettings() { settingsOverlay.classList.add("hidden"); }
+settingsBtn.addEventListener("click", () => openSettings());
+$("settings-close").addEventListener("click", closeSettings);
+settingsOverlay.addEventListener("mousedown", (e) => {
+  if (e.target === settingsOverlay) closeSettings();
 });
+modelChip.addEventListener("click", () => openSettings("general"));
 
-function closeModelInput() {
-  modelInput.classList.add("hidden");
-  modelInfo.classList.remove("hidden");
-  modelEditBtn.classList.remove("hidden");
+function switchTab(name) {
+  document.querySelectorAll(".sw-tab").forEach((t) =>
+    t.classList.toggle("on", t.dataset.tab === name));
+  document.querySelectorAll(".sw-panel").forEach((p) =>
+    p.classList.toggle("hidden", p.dataset.panel !== name));
 }
+document.querySelectorAll(".sw-tab").forEach((t) =>
+  t.addEventListener("click", () => switchTab(t.dataset.tab)));
 
-modelInput.addEventListener("keydown", async (e) => {
-  if (e.key === "Escape") { closeModelInput(); return; }
-  if (e.key !== "Enter") return;
-  const model = modelInput.value.trim();
-  if (!model) { closeModelInput(); return; }
+function updateModelChip() {
+  modelChip.textContent = `${cfg.model || "…"} · ${cfg.voice || ""}` +
+    (cfg.speech_enabled ? "" : " · ⚠ speech not configured");
+}
+function syncSettingsForm() {
+  $("set-model").value = cfg.model || "";
+  $("set-voice").value = cfg.voice || "";
+  $("set-endpoint").textContent = cfg.llm_base_url ? `endpoint: ${cfg.llm_base_url}` : "";
+  $("set-approval").value = cfg.approval_mode || "high";
+  $("set-privacy").checked = !!cfg.privacy_enabled;
+  $("set-injection").checked = !!cfg.injection_guard_enabled;
+  $("set-audit").checked = !!cfg.audit_enabled;
+  $("set-bargein").value = audioPrefs.mode;
+  $("set-sensitivity").value = audioPrefs.sensitivity;
+  $("sens-val").textContent = `×${Number(audioPrefs.sensitivity).toFixed(2)}`;
+}
+async function putSettings(changes) {
   try {
-    const res = await fetch("/api/model", {
-      method: "POST",
+    const res = await fetch("/api/settings", {
+      method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model }),
+      body: JSON.stringify(changes),
     });
     if (res.ok) {
-      updateModelInfo(model, !!modelInfo.dataset.speech);
-      addNotice(`LLM model set to ${model} (applies to the next reply).`);
+      const data = await res.json();
+      cfg = { ...cfg, ...data.config };
+      updateModelChip();
+      const keys = Object.keys(data.applied || {});
+      if (keys.length) addNotice(`Settings updated: ${keys.join(", ")}.`);
     } else {
-      const err = await res.json().catch(() => ({}));
-      addError(err.detail || `Model change failed (${res.status}).`);
+      addError(`Settings update failed (${res.status}).`);
     }
   } catch (err) {
-    addError(`Model change failed: ${err.message}`);
+    addError(`Settings update failed: ${err.message}`);
   }
-  closeModelInput();
+}
+$("set-model-apply").addEventListener("click", () => {
+  const v = $("set-model").value.trim();
+  if (v) putSettings({ llm_model: v });
 });
-modelInput.addEventListener("blur", closeModelInput);
+$("set-voice-apply").addEventListener("click", () => {
+  const v = $("set-voice").value.trim();
+  if (v) putSettings({ tts_voice: v });
+});
+$("set-approval").addEventListener("change", () =>
+  putSettings({ approval_mode: $("set-approval").value }));
+$("set-privacy").addEventListener("change", () =>
+  putSettings({ privacy_enabled: $("set-privacy").checked }));
+$("set-injection").addEventListener("change", () =>
+  putSettings({ injection_guard_enabled: $("set-injection").checked }));
+$("set-audit").addEventListener("change", () =>
+  putSettings({ audit_enabled: $("set-audit").checked }));
+
+$("set-bargein").addEventListener("change", () => {
+  audioPrefs.mode = $("set-bargein").value;
+  saveAudioPrefs();
+});
+$("set-sensitivity").addEventListener("input", () => {
+  audioPrefs.sensitivity = Number($("set-sensitivity").value);
+  $("sens-val").textContent = `×${audioPrefs.sensitivity.toFixed(2)}`;
+  saveAudioPrefs();
+});
+$("recal-btn").addEventListener("click", () => {
+  calibrating = 25;
+  calibSamples = [];
+  addNotice("Recalibrating noise floor — keep quiet for a second.");
+});
+function updateAudioDiag() {
+  const diag = $("audio-diag");
+  if (!micLive) { diag.textContent = "mic off"; return; }
+  diag.textContent =
+    `noise floor ${noiseFloor.toFixed(4)} · echo coupling ×${echoGain.toFixed(2)}` +
+    ` · mode ${audioPrefs.mode}`;
+}
+setInterval(() => {
+  if (!settingsOverlay.classList.contains("hidden")) updateAudioDiag();
+}, 1000);
+
+// logs tab
+async function refreshLogList() {
+  try {
+    const res = await fetch("/api/logs");
+    const files = await res.json();
+    const list = $("log-list");
+    list.innerHTML = files.length ? "" :
+      `<div class="side-empty">No log files yet.</div>`;
+    for (const f of files.slice(0, 15)) {
+      const el = document.createElement("div");
+      el.className = "log-item";
+      el.innerHTML = `<span class="log-name"></span><span class="log-meta"></span>`;
+      el.querySelector(".log-name").textContent = f.name;
+      el.querySelector(".log-meta").textContent =
+        `${f.modified} · ${(f.size / 1024).toFixed(1)} kB`;
+      el.addEventListener("click", async () => {
+        const entries = await (await fetch(`/api/logs/${encodeURIComponent(f.name)}`)).json();
+        const view = $("log-view");
+        view.textContent = entries.map((e) => {
+          const rest = Object.entries(e)
+            .filter(([k]) => !["ts", "t", "kind"].includes(k))
+            .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
+            .join(" ");
+          return `${e.ts}  ${e.kind}  ${rest}`;
+        }).join("\n") || "(empty)";
+        view.classList.remove("hidden");
+      });
+      list.appendChild(el);
+    }
+  } catch { /* server restarting */ }
+}
+
+// skills tab
+function renderSkillsTab() {
+  const list = $("skills-list");
+  list.innerHTML = skills.length ? "" :
+    `<div class="side-empty">No skills found in skills/.</div>`;
+  for (const s of skills) {
+    const el = document.createElement("div");
+    el.className = "skill-item";
+    el.innerHTML = `<div class="skill-top"><b class="sk-title"></b>
+        <span class="sk-risk badge"></span></div>
+      <div class="sk-desc"></div><div class="sk-meta"></div>`;
+    el.querySelector(".sk-title").textContent = s.title || s.name;
+    el.querySelector(".sk-risk").textContent = s.risk;
+    el.querySelector(".sk-risk").classList.add(`risk-${s.risk}`);
+    el.querySelector(".sk-desc").textContent = s.description;
+    el.querySelector(".sk-meta").textContent =
+      [s.servers.length ? `servers: ${s.servers.join(", ")}` : "",
+       s.categories.length ? `categories: ${s.categories.join(", ")}` : ""]
+        .filter(Boolean).join(" · ");
+    list.appendChild(el);
+  }
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (!settingsOverlay.classList.contains("hidden")) { closeSettings(); return; }
+  if (serverState === "thinking" || serverState === "speaking" ||
+      serverState === "transcribing") {
+    stopPlayback();
+    send({ type: "interrupt" });
+    interruptCooldownUntil = performance.now() + INTERRUPT_COOLDOWN_MS;
+  }
+});
 
 // ---------------------------------------------------------------------------
-// Microphone capture + VAD + barge-in
+// TTS playback — AEC-friendly path + playback envelope tracking
+// ---------------------------------------------------------------------------
+function ensurePlayback() {
+  if (playCtx) return;
+  playCtx = new AudioContext();
+  // Route through a MediaStream + <audio> element: media-element output is in
+  // the browser's echo-cancellation reference, raw WebAudio output is not.
+  playDest = playCtx.createMediaStreamDestination();
+  ttsAudioEl.srcObject = playDest.stream;
+  ttsAudioEl.play().catch(() => { /* resumes on first user gesture */ });
+}
+
+function playChunk(arrayBuffer) {
+  if (arrayBuffer.byteLength < 2) return;
+  ensurePlayback();
+  if (playCtx.state === "suspended") playCtx.resume();
+
+  const int16 = new Int16Array(arrayBuffer);
+  const f32 = new Float32Array(int16.length);
+  let sum = 0;
+  for (let i = 0; i < int16.length; i++) {
+    const s = int16[i] / 32768;
+    f32[i] = s;
+    sum += s * s;
+  }
+  const rms = Math.sqrt(sum / int16.length);
+
+  const buf = playCtx.createBuffer(1, f32.length, ttsSampleRate);
+  buf.getChannelData(0).set(f32);
+  const src = playCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(playDest);
+  const t = Math.max(playCtx.currentTime + 0.06, nextPlayTime);
+  src.start(t);
+  nextPlayTime = t + buf.duration;
+
+  // Wall-clock envelope segment for the echo gate.
+  const wallStart = performance.now() + (t - playCtx.currentTime) * 1000;
+  playbackSegs.push({ start: wallStart, end: wallStart + buf.duration * 1000, rms });
+  while (playbackSegs.length && playbackSegs[0].end < performance.now() - 1500) {
+    playbackSegs.shift();
+  }
+
+  activeSources.add(src);
+  src.onended = () => activeSources.delete(src);
+}
+
+function playbackEnvAt(wall) {
+  // Max playback RMS in a window generous enough to cover output latency
+  // and room reverb (~120 ms early, ~350 ms tail).
+  let env = 0;
+  for (const s of playbackSegs) {
+    if (wall >= s.start - 120 && wall <= s.end + 350) env = Math.max(env, s.rms);
+  }
+  return env;
+}
+
+function stopPlayback() {
+  for (const src of activeSources) { try { src.stop(); } catch { /* done */ } }
+  activeSources.clear();
+  nextPlayTime = 0;
+  playbackSegs.length = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Microphone capture + adaptive VAD + echo-aware barge-in
 // ---------------------------------------------------------------------------
 async function startMic() {
-  micStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,   // keeps TTS playback out of the mic signal
-      noiseSuppression: true,
-      autoGainControl: true,
-      channelCount: 1,
-    },
-  });
+  const constraints = {
+    echoCancellation: true,    // AEC reference now includes our TTS playback
+    noiseSuppression: true,
+    autoGainControl: true,
+    channelCount: 1,
+  };
+  // Chrome's voice-isolation, where available, further suppresses non-voice.
+  if (navigator.mediaDevices.getSupportedConstraints().voiceIsolation) {
+    constraints.voiceIsolation = true;
+  }
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: constraints });
   micCtx = new AudioContext();
   await micCtx.audioWorklet.addModule("/static/pcm-worklet.js");
   const source = micCtx.createMediaStreamSource(micStream);
@@ -729,6 +1262,9 @@ async function startMic() {
   node.port.onmessage = (ev) => onMicChunk(ev.data);
   micLive = true;
   micBtn.classList.add("live");
+  calibrating = 25;              // ~0.8 s ambient calibration
+  calibSamples = [];
+  voicedRun = 0;
 }
 
 function stopMic() {
@@ -757,18 +1293,60 @@ function onMicChunk(int16) {
   if (!micLive || !wsReady) return;
   const rms = rmsOf(int16);
   vadFill.style.width = `${Math.min(100, rms * 900)}%`;
+  const wall = performance.now();
 
+  // Initial ambient calibration: collect, then set the noise floor.
+  if (calibrating > 0) {
+    calibSamples.push(rms);
+    if (--calibrating === 0) {
+      const sorted = [...calibSamples].sort((a, b) => a - b);
+      noiseFloor = Math.min(0.03, Math.max(0.002,
+        sorted[Math.floor(sorted.length / 2)] * 1.1));
+    }
+    return; // never capture while calibrating
+  }
+
+  const env = playbackEnvAt(wall);
+  const playbackActive = env > 0.0005;
   const busy = assistantBusy();
-  const threshold = busy ? VAD_THRESHOLD * BARGE_IN_FACTOR : VAD_THRESHOLD;
-  const voiced = rms > threshold;
+
+  // Slow ambient tracking while idle and quiet.
+  if (!busy && !capturing && rms < noiseFloor * 2) {
+    noiseFloor = Math.min(0.03, Math.max(0.002, noiseFloor * 0.99 + rms * 0.01));
+  }
+  // Adapt the speaker->mic coupling estimate while TTS plays and the user is
+  // not speaking (voicedRun === 0 keeps a real barge-in from polluting it).
+  if (playbackActive && !capturing && voicedRun === 0 && env > 0.002) {
+    echoGain = Math.min(4, echoGain * 0.9 + (rms / env) * 0.1);
+  }
+
+  const base = Math.max(VAD_BASE, noiseFloor * 3) / audioPrefs.sensitivity;
+  let voiced;
+  if (busy && playbackActive) {
+    // Echo gate: mic must clearly exceed both the strict threshold and the
+    // expected echo level for the audio playing right now.
+    voiced = rms > Math.max(base * 1.8, echoGain * env * ECHO_MARGIN);
+  } else if (busy) {
+    voiced = rms > base * 1.4; // thinking/transcribing: no echo, mildly strict
+  } else {
+    voiced = rms > base;
+  }
+  if (wall < interruptCooldownUntil) voiced = false;
 
   if (!capturing) {
+    // Manual mode: never auto-interrupt — ignore speech while busy.
+    if (busy && audioPrefs.mode === "manual") { voicedRun = 0; return; }
     preroll.push(int16);
     if (preroll.length > PREROLL_CHUNKS) preroll.shift();
     voicedRun = voiced ? voicedRun + 1 : 0;
-    if (voicedRun >= VAD_ATTACK_CHUNKS) {
-      // Barge-in: user started talking over the assistant.
-      if (busy) { stopPlayback(); send({ type: "interrupt" }); }
+    const needed = busy && playbackActive ? BARGE_ATTACK_CHUNKS
+      : busy ? Math.max(4, VAD_ATTACK_CHUNKS) : VAD_ATTACK_CHUNKS;
+    if (voicedRun >= needed) {
+      if (busy) {  // barge-in: sustained real speech over the assistant
+        stopPlayback();
+        send({ type: "interrupt" });
+        interruptCooldownUntil = 0;
+      }
       capturing = true;
       silenceMs = 0;
       micBtn.classList.add("capturing");
@@ -778,7 +1356,7 @@ function onMicChunk(int16) {
     }
   } else {
     ws.send(int16.buffer);
-    if (rms > VAD_THRESHOLD) {
+    if (rms > base) {
       silenceMs = 0;
     } else {
       silenceMs += CHUNK_MS;
@@ -797,43 +1375,24 @@ micBtn.addEventListener("click", async () => {
   try { await startMic(); }
   catch (err) { addError(`Microphone error: ${err.message}`); }
 });
-
-// ---------------------------------------------------------------------------
-// TTS playback (raw PCM16 -> scheduled AudioBuffers)
-// ---------------------------------------------------------------------------
-function playChunk(arrayBuffer) {
-  if (arrayBuffer.byteLength < 2) return;
-  if (!playCtx) playCtx = new AudioContext();
-  if (playCtx.state === "suspended") playCtx.resume();
-
-  const int16 = new Int16Array(arrayBuffer);
-  const f32 = new Float32Array(int16.length);
-  for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
-
-  const buf = playCtx.createBuffer(1, f32.length, ttsSampleRate);
-  buf.getChannelData(0).set(f32);
-  const src = playCtx.createBufferSource();
-  src.buffer = buf;
-  src.connect(playCtx.destination);
-  const t = Math.max(playCtx.currentTime + 0.06, nextPlayTime);
-  src.start(t);
-  nextPlayTime = t + buf.duration;
-  activeSources.add(src);
-  src.onended = () => activeSources.delete(src);
-}
-
-function stopPlayback() {
-  for (const src of activeSources) { try { src.stop(); } catch { /* already done */ } }
-  activeSources.clear();
-  nextPlayTime = 0;
-}
+stopBtn.addEventListener("click", () => {
+  stopPlayback();
+  send({ type: "interrupt" });
+  interruptCooldownUntil = performance.now() + INTERRUPT_COOLDOWN_MS;
+});
 
 // ---------------------------------------------------------------------------
 // Typed input
 // ---------------------------------------------------------------------------
 function sendTyped() {
-  const text = textInput.value.trim();
+  let text = textInput.value.trim();
   if (!text) return;
+  if (wfChips.length) {
+    text += "\n\nContext from Canvas apps:\n" +
+      wfChips.map((c) => `- ${c.text}`).join("\n");
+    wfChips = [];
+    renderWfChips();
+  }
   stopPlayback();
   send({ type: "text", text });
   textInput.value = "";
@@ -843,7 +1402,7 @@ sendBtn.addEventListener("click", sendTyped);
 resetBtn.addEventListener("click", () => { stopPlayback(); send({ type: "reset" }); });
 
 // ---------------------------------------------------------------------------
-// MCP panel
+// MCP panel (inside Settings)
 // ---------------------------------------------------------------------------
 const mcpList = $("mcp-list"), mcpForm = $("mcp-form"), mcpError = $("mcp-error");
 const mcpTransport = $("mcp-transport"), mcpCommand = $("mcp-command"), mcpUrl = $("mcp-url");
@@ -860,7 +1419,6 @@ async function refreshServers() {
     renderServers(await res.json());
   } catch { /* server restarting */ }
 }
-
 function renderServers(servers) {
   mcpList.innerHTML = "";
   if (!servers.length) {
@@ -901,12 +1459,14 @@ function renderServers(servers) {
       await fetch(`/api/mcp/servers/${encodeURIComponent(s.name)}`, { method: "DELETE" });
       refreshServers();
       refreshAgents();
+      refreshApps();
     });
     el.querySelector(".reconnect").addEventListener("click", async () => {
       el.querySelector(".reconnect").textContent = "…";
       await fetch(`/api/mcp/servers/${encodeURIComponent(s.name)}/reconnect`, { method: "POST" });
       refreshServers();
       refreshAgents();
+      refreshApps();
     });
     mcpList.appendChild(el);
   }
@@ -942,6 +1502,7 @@ mcpForm.addEventListener("submit", async (e) => {
     btn.disabled = false; btn.textContent = "Add & connect";
     refreshServers();
     refreshAgents();
+    refreshApps();
   }
 });
 
@@ -951,4 +1512,5 @@ mcpForm.addEventListener("submit", async (e) => {
 connect();
 refreshServers();
 refreshAgents();
-setInterval(() => { refreshServers(); refreshAgents(); }, 10000);
+refreshApps();
+setInterval(() => { refreshServers(); refreshAgents(); refreshApps(); }, 10000);

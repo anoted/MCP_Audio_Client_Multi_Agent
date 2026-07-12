@@ -3,6 +3,8 @@ __pycache__/
 .env
 mcp_servers.json
 conversations/
+logs/
+app_settings.json
 .venv/
 venv/
 *.wav

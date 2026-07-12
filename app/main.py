@@ -10,11 +10,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import conversations
+from . import audit, conversations
 from .agents import describe_agents, initiator
 from .config import settings
 from .mcp_manager import MCPManager, MCPServerConfig
 from .session import VoiceSession
+from .skills import registry as skill_registry
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -30,6 +31,7 @@ def _rerun_initiator() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    skill_registry.load()
     await mcp_manager.startup()
     _rerun_initiator()  # classify tools in the background at start
     yield
@@ -47,13 +49,7 @@ async def index() -> FileResponse:
 
 @app.get("/api/config")
 async def get_config() -> dict:
-    return {
-        "model": settings.llm_model,
-        "llm_base_url": settings.llm_base_url,
-        "voice": settings.tts_voice,
-        "tts_sample_rate": settings.tts_sample_rate,
-        "speech_enabled": settings.speech_configured,
-    }
+    return settings.public()
 
 
 class SetModelRequest(BaseModel):
@@ -65,13 +61,64 @@ async def set_model(req: SetModelRequest) -> dict:
     model = req.model.strip()
     if not model:
         raise HTTPException(status_code=400, detail="Model name must not be empty.")
-    settings.llm_model = model
+    settings.update({"llm_model": model})
     return {"model": model}
+
+
+class UpdateSettingsRequest(BaseModel):
+    llm_model: str | None = None
+    tts_voice: str | None = None
+    approval_mode: str | None = None
+    privacy_enabled: bool | None = None
+    injection_guard_enabled: bool | None = None
+    audit_enabled: bool | None = None
+
+
+@app.put("/api/settings")
+async def update_settings(req: UpdateSettingsRequest) -> dict:
+    applied = settings.update(req.model_dump(exclude_none=True))
+    return {"applied": applied, "config": settings.public()}
 
 
 @app.get("/api/agents")
 async def get_agents() -> dict:
     return {"agents": describe_agents(), "initiator": initiator.describe()}
+
+
+@app.get("/api/skills")
+async def get_skills() -> dict:
+    return {"skills": skill_registry.describe()}
+
+
+@app.get("/api/apps")
+async def get_apps() -> dict:
+    """Openable MCP apps: argument-free `open_*` tools across servers."""
+    apps = []
+    for spec in mcp_manager.openai_tools():
+        target = mcp_manager.resolve(spec["function"]["name"])
+        if not target:
+            continue
+        server, tool = target
+        if tool.startswith("open_"):
+            apps.append({
+                "server": server,
+                "tool": tool,
+                "description": (spec["function"].get("description") or "")[:200],
+            })
+    return {"apps": apps, "resources": mcp_manager.ui_resources()}
+
+
+@app.get("/api/logs")
+async def get_logs() -> list[dict]:
+    return audit.list_log_files()
+
+
+@app.get("/api/logs/{name}")
+async def get_log(name: str) -> list[dict]:
+    try:
+        return audit.read_log_tail(name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"No log '{name}'.") from exc
 
 
 # --- conversations --------------------------------------------------------------

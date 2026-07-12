@@ -1,125 +1,129 @@
-# Scenario: prepare a course week on Canvas with the multi-agent system
+# Scenario: prepare a course week on Canvas with the workflow system
 
-A practical end-to-end test of the agent rework: category-based tool grants,
-the manager calling the planner itself, and sub-agents that carry a full tool
-category instead of one or two hand-picked tools.
+An end-to-end test of the task→review→verification workflow: skill selection,
+server-routed tool grants, human plan approval, approval checkpoints on risky
+writes, enforced reviewer/verifier passes, MCP apps, and the audit log.
 
 > ⚠️ **The Canvas tools are LIVE.** Every write tool changes a real Canvas
-> instance immediately. Run phases 3–5 only against a **sandbox / test course**
+> instance immediately. Run phases 4–6 only against a **sandbox / test course**
 > where you are the teacher and no real students are enrolled. In particular:
 >
 > - `grade_submission` changes real student grades.
 > - `create_announcement` notifies every enrolled student.
 > - `delete_module` / `delete_module_item` are the **only** delete tools —
->   assignments, quizzes, and pages created during the test cannot be deleted
->   through MCP and must be removed manually in the Canvas UI afterwards.
+>   assignments, quizzes, and pages created during the test must be removed
+>   manually in the Canvas UI afterwards.
 >
-> Phases 0–2 are safe anywhere: phase 0 touches no Canvas tool at all, and
-> phases 1–2 use read-only tools.
+> Phases 0–3 are safe anywhere (no tool, or read-only tools). See also
+> `SECURITY_CHECKLIST.md`.
 
 ## Setup
 
-1. Conda env `mcpagents` has the Canvas server's requirements installed
-   (`examples/Canvas_MCP/requirements.txt`).
+1. Conda env `mcpagents` has the Canvas server's requirements installed.
 2. `examples/Canvas_MCP/.env` contains `CANVAS_BASE_URL` and
-   `CANVAS_API_TOKEN` (a token for the sandbox account).
-3. `mcp_servers.json` already registers the server:
-   `conda run --no-capture-output -n mcpagents python examples/Canvas_MCP/canvas_mcp_server.py`
-   (stdio).
-4. Start the app (`python -m uvicorn app.main:app --port 8000`), open the UI:
-   - MCP panel: **Canvas** connected, ~31 tools listed.
-   - Agents panel: initiator line like `31 tools → 13 read · 18 modify`
-     (LLM classification may adjust the split slightly).
+   `CANVAS_API_TOKEN` (sandbox account token).
+3. Start the app (`python -m uvicorn app.main:app --port 8000`) and check:
+   - Settings ⚙ → MCP Servers: **Canvas** connected (~37 tools).
+   - Agents panel: initiator line like `37 tools → 19 read · 18 modify`.
+   - Settings ⚙ → General: approval mode = **high-risk only** (default).
+   - Apps panel shows **course explorer**.
 
-Replace `<COURSE_ID>` below with your sandbox course id (phase 1 finds it).
+Replace `<COURSE_ID>` with your sandbox course id (phase 1 finds it).
 
 ## Phase 0 — wiring check (no Canvas calls)
-
-Type:
 
 > `@manager Deploy one sub-agent with no tools that writes a two-sentence
 > checklist for preparing a new course week. Do not plan first, just run it.`
 
-**Expect:** a 🤖 sub-agent card with an empty tool list that still returns a
-report. This proves delegation works before any live tool is involved.
+**Expect:** a 🤖 worker card with an empty tool list that still reports back.
 
-## Phase 1 — read-only reconnaissance (safe)
+## Phase 1 — apps + read-only reconnaissance (safe)
 
-> `@explorer List my Canvas courses and tell me which one looks like a
-> sandbox or test course.`
+1. Click **course explorer** in the Apps panel. Browse to your sandbox
+   course; check the Modules/Assignments/Quizzes tabs, expand a module, and
+   open 📊 grades on an assignment (inline histogram).
+2. Click **+ workflow** on the course entry — a context chip appears above
+   the input. Then type: `Summarize the current structure of this course.`
 
-then, with the id it found:
+**Expect:** the chip's context is attached to the message; the explorer's
+browsing calls appear in the Activity panel as `app_tool_call` events (all
+read-only — try nothing else: the bridge refuses write tools).
 
-> `@explorer In course <COURSE_ID>, summarize the existing modules and
-> assignments so I know the current structure.`
+3. Ask for charts by voice or text:
+   > `@explorer show me the grading progress donut for course <COURSE_ID>`
 
-**Expect:** explorer calls only read tools (it physically has no others —
-check the tool cards: `list_courses`, `list_modules`, `list_assignments`, …).
+**Expect:** an interactive chart card plus a spoken summary of the numbers.
 
-## Phase 2 — manager plans by itself (safe)
-
-Go straight to the manager **without** visiting `@planner` first:
+## Phase 2 — plan + human approval (safe)
 
 > `@manager In course <COURSE_ID>, prepare a new week called "Week 3: NumPy
 > Fundamentals": one module, an overview page inside it, one 20-point
 > assignment due next Friday 23:59, and a 3-question quiz — everything left
-> unpublished. Plan first, then wait for my go.`
+> unpublished.`
 
 **Expect:**
 
-- The manager calls **`run_planner`** (a `planner` sub-agent card appears
-  with read-only tools granted) instead of asking you to switch agents.
-- The Plan panel fills with ~5–7 concrete steps.
-- No write tool has been called yet.
+- Workflow panel: skill chip switches to **content builder**
+  (`canvas-content-builder`), stage → *Plan*.
+- The manager calls `run_planner` (planner card, read-only grants).
+- The plan lands in the panel and stage flips to **Approve** — the manager
+  *cannot* run workers now (structurally blocked, try telling it to).
+- No write tool has been called.
 
-## Phase 3 — execution with category grants (SANDBOX ONLY)
+## Phase 3 — approve the plan (safe)
 
-> `@manager Go ahead with the plan.`
+Click **✓ Approve plan** (or just say **"approve"**).
 
-Watch each sub-agent card's granted tool list. **Pass** looks like grants by
-category or class, e.g.:
+**Expect:** stage → *Execute*, and the manager resumes hands-free.
 
-| Step | Reasonable grant | Expands to |
-|---|---|---|
-| create the module | `["modules"]` | all 8 module tools |
-| overview page + attach | `["pages", "modules"]` | page + module tools |
-| assignment | `["assignments", "read"]` | 3 assignment tools + all read tools |
-| quiz + questions | `["quizzes"]` | all 5 quiz tools |
-| verify at the end | `["read"]` | all 13 read-only tools |
+## Phase 4 — execution with review/verify (SANDBOX ONLY)
 
-**Fail** (the old shallow behavior) looks like a sub-agent granted exactly one
-or two hand-picked tools that then reports it was missing a tool mid-task —
-e.g. a quiz builder holding only `create_quiz` and unable to call
-`add_quiz_question`.
+Watch the workflow run. **Pass** looks like:
 
-Also check: items get ticked `in_progress` → `done` in the Plan panel, and
-each instruction repeats the ids the sub-agent needs (course id, module id
-from the previous report, …) since sub-agents share no memory.
+- Worker sub-agents with category grants (e.g. `["modules"]` → all module
+  tools), scoped to the Canvas server.
+- Steps marked `in_progress` → after the worker: a 🔎 **reviewer** card and a
+  ✅ **verifier** card (read-only tools) whose verdicts appear as `R✓ V✓`
+  badges on the step — only then does the step turn done. Try asking the
+  manager to skip review: `set_todo_status` refuses.
+- `upload_file` or any publish/delete/grade call pauses on a 🛡️ **approval
+  card** (high-risk). Deny one once — the worker must report the denial and
+  the manager must adapt, not retry silently.
 
-## Phase 4 — verification (safe)
+## Phase 5 — verification + privacy (safe)
 
-> `@explorer In course <COURSE_ID>, show the "Week 3: NumPy Fundamentals"
-> module with its items, and confirm the assignment and quiz are unpublished.`
+> `@verifier Confirm that course <COURSE_ID> now has a "Week 3: NumPy
+> Fundamentals" module whose page, assignment and quiz are all unpublished.`
 
-## Phase 5 — cleanup (SANDBOX ONLY)
+Then, if the sandbox has (fake) student submissions:
+
+> `@explorer List the submissions for assignment <ID> in course <COURSE_ID>.`
+
+**Expect:** with privacy ON, the chat and LLM context show `Student-1`,
+`Student-2` … instead of names; the audit log (Settings → Privacy) shows the
+same pseudonyms.
+
+## Phase 6 — cleanup (SANDBOX ONLY)
 
 > `@manager Remove the "Week 3: NumPy Fundamentals" module from course
-> <COURSE_ID>: delete its items, then the module itself. The underlying
-> assignment, quiz, and page can't be deleted with your tools — just tell me
-> so I can remove them in the Canvas UI.`
+> <COURSE_ID>: delete its items, then the module itself. Tell me which
+> leftover objects I must delete manually.`
 
-**Expect:** one sub-agent with `["modules"]` (or `["modules", "read"]`)
-running `delete_module_item` / `delete_module`, and the manager telling you
-which leftover objects to delete manually.
+**Expect:** plan → approval → a worker with `["modules"]`; `delete_module*`
+calls pause for approval (high-risk); the manager lists the page/assignment/
+quiz you must remove in the Canvas UI.
 
 ## Pass checklist
 
-- [ ] Phase 0 sub-agent ran with zero tools and reported back.
-- [ ] Explorer never had a write tool available.
-- [ ] Manager produced the plan itself via `run_planner` — no manual
-      `@planner` step was needed.
-- [ ] Every executing sub-agent got a category/class grant (3+ tools), not a
-      one-tool grant, and none stalled on a missing tool.
-- [ ] Plan items were marked in-progress/done as work proceeded.
-- [ ] Week 3 module, page, assignment, and quiz existed (unpublished) after
-      phase 3 and the module was gone after phase 5.
+- [ ] Explorer app browsed live data and pushed context chips; bridge stayed
+      read-only.
+- [ ] Skill auto-selected; grants stayed within the Canvas server.
+- [ ] Plan paused for approval; saying "approve" resumed it.
+- [ ] Every write step got reviewer + verifier PASS before turning done;
+      closing without them was refused.
+- [ ] High-risk calls paused on approval cards; a denial was handled
+      gracefully.
+- [ ] Privacy pseudonyms in chat/logs; real names in Canvas-bound writes.
+- [ ] `logs/session-*.jsonl` contains the full audit trail.
+- [ ] Speaker playback never interrupted the assistant; speaking over it
+      stopped it within ~0.3 s.

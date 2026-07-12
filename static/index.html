@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Voice Client</title>
+  <title>Voice Workflow Client</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -11,26 +11,23 @@
     <div class="brand">
       <span class="logo">🎙️</span>
       <div>
-        <h1>Voice Client</h1>
-        <div class="sub">
-          <span id="model-info">connecting…</span>
-          <button id="model-edit-btn" class="tiny ghost" title="Change LLM model">✎</button>
-          <input id="model-input" class="hidden" placeholder="exact model name" spellcheck="false">
-        </div>
+        <h1>Voice Workflow</h1>
+        <button id="model-chip" class="model-chip" title="LLM model — click to change in Settings">…</button>
       </div>
     </div>
     <div class="header-right">
-      <button id="theme-btn" class="ghost" title="Toggle light/dark mode">☀️</button>
-      <button id="conv-btn" class="ghost" title="Save / load conversations">💾</button>
-      <span id="conn-dot" class="dot off" title="WebSocket"></span>
       <span id="status-pill" class="pill">connecting</span>
+      <span id="conn-dot" class="dot off" title="WebSocket"></span>
+      <button id="theme-btn" class="ghost icon" title="Toggle light/dark mode">☀️</button>
+      <button id="conv-btn" class="ghost icon" title="Save / load conversations">💾</button>
+      <button id="settings-btn" class="ghost icon" title="Settings">⚙️</button>
       <button id="reset-btn" class="ghost" title="Clear conversation">Reset</button>
     </div>
-    <div id="conv-panel" class="hidden">
+    <div id="conv-panel" class="popover hidden">
       <h3>Conversations</h3>
       <div class="conv-save-row">
         <input id="conv-name" placeholder="name (optional)">
-        <button id="conv-save-btn">Save current</button>
+        <button id="conv-save-btn" class="primary">Save current</button>
       </div>
       <div id="conv-list" class="conv-list"></div>
     </div>
@@ -40,48 +37,70 @@
     <section id="chat-wrap">
       <div id="chat">
         <div class="notice">
-          Click the microphone to start talking — speaking over the assistant
-          interrupts it. Type <b>@explorer</b>, <b>@planner</b>, <b>@manager</b>
-          or <b>@assistant</b> to switch agents; voice always talks to the
+          <b>Tell the manager what you want done</b> — it plans, waits for your
+          approval, then executes with worker agents while a reviewer and a
+          verifier check every change. Risky tool calls pause for your OK.
+          Type <b>@</b> to address a specific agent; voice always goes to the
           active agent.
         </div>
       </div>
     </section>
 
     <aside id="side-panel">
-      <section>
-        <h2>Agents</h2>
+      <section id="wf-section" class="card">
+        <div class="card-head">
+          <h2>Workflow</h2>
+          <span id="wf-stage-badge" class="badge">idle</span>
+        </div>
+        <div id="wf-stages">
+          <span data-stage="planning">Plan</span><i></i>
+          <span data-stage="plan_review">Approve</span><i></i>
+          <span data-stage="executing">Execute</span><i></i>
+          <span data-stage="complete">Done</span>
+        </div>
+        <div id="wf-task" class="wf-task hidden"></div>
+        <div class="wf-skill-row">
+          <label for="skill-select">Skill</label>
+          <select id="skill-select"><option value="">auto / none</option></select>
+        </div>
+        <div id="plan-approval" class="plan-approval hidden">
+          <div class="pa-text">The plan is ready — review the steps below.</div>
+          <input id="plan-note" placeholder="optional note / requested change">
+          <div class="pa-btns">
+            <button id="plan-approve" class="primary">✓ Approve plan</button>
+            <button id="plan-reject" class="danger-ghost">✗ Request changes</button>
+          </div>
+        </div>
+        <div id="todo-list" class="todo-list">
+          <div class="side-empty">No plan yet — just say what you need.</div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Agents</h2></div>
         <div id="initiator-status" class="initiator-status">initiator: idle</div>
         <div id="agent-list" class="agent-list"></div>
       </section>
 
-      <section>
-        <h2>Plan</h2>
-        <div id="todo-list" class="todo-list">
-          <div class="side-empty">No plan yet — ask <b>@planner</b> for one.</div>
-        </div>
+      <section id="apps-section" class="card hidden">
+        <div class="card-head"><h2>Apps</h2></div>
+        <div id="apps-list" class="apps-list"></div>
       </section>
 
-      <section>
-        <h2>MCP Servers</h2>
-        <div id="mcp-list" class="mcp-list"></div>
-        <form id="mcp-form" autocomplete="off">
-          <h3>Register server</h3>
-          <input id="mcp-name" placeholder="name (e.g. demo)" required
-                 pattern="[a-zA-Z0-9_\-]{1,32}">
-          <select id="mcp-transport">
-            <option value="stdio">stdio (local command)</option>
-            <option value="http">streamable HTTP</option>
-            <option value="sse">SSE</option>
-          </select>
-          <input id="mcp-command" placeholder="command, e.g. python examples/demo_mcp_server.py">
-          <input id="mcp-url" placeholder="url, e.g. http://localhost:9000/mcp" class="hidden">
-          <button type="submit">Add & connect</button>
-          <div id="mcp-error" class="form-error"></div>
-        </form>
+      <section class="card" id="activity-section">
+        <div class="card-head">
+          <h2>Activity</h2>
+          <button id="activity-clear" class="ghost tiny" title="Clear">clear</button>
+        </div>
+        <div id="activity-log" class="activity-log"></div>
       </section>
     </aside>
   </main>
+
+  <div id="wf-context-bar" class="hidden">
+    <span class="wfc-label">Context for next message:</span>
+    <span id="wf-chips"></span>
+  </div>
 
   <footer>
     <button id="mic-btn" title="Start/stop microphone">
@@ -89,16 +108,148 @@
         <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/>
       </svg>
     </button>
+    <button id="stop-btn" class="hidden" title="Stop the assistant (Esc)">⏹</button>
     <div id="vad-meter"><div id="vad-fill"></div></div>
-    <span id="active-agent" class="agent-chip" title="Active agent">@assistant</span>
+    <span id="active-agent" class="agent-chip" title="Active agent — click to switch">@manager</span>
     <div id="input-wrap">
       <div id="mention-pop" class="hidden"></div>
-      <input id="text-input" placeholder="Type a message — @agent to switch (Enter to send)…"
+      <input id="text-input" placeholder="Describe a task — @agent to switch (Enter to send)…"
              autocomplete="off" spellcheck="false">
     </div>
-    <button id="send-btn">Send</button>
+    <button id="send-btn" class="primary">Send</button>
   </footer>
 
+  <div id="settings-overlay" class="overlay hidden">
+    <div id="settings-window" role="dialog" aria-modal="true" aria-label="Settings">
+      <div class="sw-head">
+        <h2>Settings</h2>
+        <button id="settings-close" class="close-x" title="Close (Esc)">✕</button>
+      </div>
+      <div class="sw-tabs">
+        <button class="sw-tab on" data-tab="general">General</button>
+        <button class="sw-tab" data-tab="audio">Audio</button>
+        <button class="sw-tab" data-tab="privacy">Privacy &amp; Security</button>
+        <button class="sw-tab" data-tab="mcp">MCP Servers</button>
+        <button class="sw-tab" data-tab="skills">Skills</button>
+      </div>
+      <div class="sw-body">
+
+        <div class="sw-panel" data-panel="general">
+          <div class="field">
+            <label>LLM model</label>
+            <div class="row-inline">
+              <input id="set-model" placeholder="exact model name" spellcheck="false">
+              <button id="set-model-apply" class="primary">Apply</button>
+            </div>
+            <div class="hint" id="set-endpoint"></div>
+          </div>
+          <div class="field">
+            <label>TTS voice</label>
+            <div class="row-inline">
+              <input id="set-voice" placeholder="e.g. Magpie-Multilingual.EN-US.Aria" spellcheck="false">
+              <button id="set-voice-apply" class="primary">Apply</button>
+            </div>
+          </div>
+          <div class="field">
+            <label>Human approval checkpoints</label>
+            <select id="set-approval">
+              <option value="all">Every modifying tool call</option>
+              <option value="high">High-risk actions only (grades, publish, delete, announce…)</option>
+              <option value="off">Off — no approval pauses (not recommended)</option>
+            </select>
+            <div class="hint">Plans always pause for approval unless this is off.
+              Approvals time out as “denied” after 10 minutes.</div>
+          </div>
+        </div>
+
+        <div class="sw-panel hidden" data-panel="audio">
+          <div class="field">
+            <label>Voice interruption (barge-in)</label>
+            <select id="set-bargein">
+              <option value="smart">Smart — echo-aware, speak over the assistant to stop it</option>
+              <option value="manual">Manual — assistant is never auto-interrupted; use ⏹ / Esc</option>
+            </select>
+            <div class="hint">Smart mode plays TTS through an echo-cancelled path and
+              additionally gates the mic against the known playback signal, so speaker
+              output should not interrupt the assistant by itself.</div>
+          </div>
+          <div class="field">
+            <label>Mic sensitivity <span id="sens-val" class="hint-inline"></span></label>
+            <input id="set-sensitivity" type="range" min="0.5" max="2" step="0.05" value="1">
+            <div class="hint">Higher = quieter speech triggers the mic. The noise floor
+              auto-calibrates in the first second after the mic starts.</div>
+          </div>
+          <div class="field">
+            <label>Echo diagnostics</label>
+            <div class="hint" id="audio-diag">mic off</div>
+            <button id="recal-btn" class="ghost">Recalibrate noise floor</button>
+          </div>
+        </div>
+
+        <div class="sw-panel hidden" data-panel="privacy">
+          <div class="field switch-row">
+            <div>
+              <label>Privacy-preserving processing</label>
+              <div class="hint">Student names/emails in tool results are replaced with
+                pseudonyms (Student-1, …) before reaching the LLM provider; real values
+                are restored in outgoing writes and approval cards.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="set-privacy"><i></i></label>
+          </div>
+          <div class="field switch-row">
+            <div>
+              <label>Prompt-injection guard</label>
+              <div class="hint">Tool results matching injection patterns are wrapped in a
+                security notice and flagged in the activity log.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="set-injection"><i></i></label>
+          </div>
+          <div class="field switch-row">
+            <div>
+              <label>Audit log</label>
+              <div class="hint">One JSONL file per session in <code>logs/</code>; also
+                streamed to the Activity panel.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="set-audit"><i></i></label>
+          </div>
+          <div class="field">
+            <label>Session logs</label>
+            <div id="log-list" class="log-list"></div>
+            <pre id="log-view" class="log-view hidden"></pre>
+          </div>
+        </div>
+
+        <div class="sw-panel hidden" data-panel="mcp">
+          <div id="mcp-list" class="mcp-list"></div>
+          <form id="mcp-form" autocomplete="off">
+            <h3>Register server</h3>
+            <input id="mcp-name" placeholder="name (e.g. demo)" required
+                   pattern="[a-zA-Z0-9_\-]{1,32}">
+            <select id="mcp-transport">
+              <option value="stdio">stdio (local command)</option>
+              <option value="http">streamable HTTP</option>
+              <option value="sse">SSE</option>
+            </select>
+            <input id="mcp-command" placeholder="command, e.g. python examples/demo_mcp_server.py">
+            <input id="mcp-url" placeholder="url, e.g. http://localhost:9000/mcp" class="hidden">
+            <button type="submit" class="primary">Add &amp; connect</button>
+            <div id="mcp-error" class="form-error"></div>
+          </form>
+        </div>
+
+        <div class="sw-panel hidden" data-panel="skills">
+          <div class="hint" style="margin-bottom:10px">Skills are workflow playbooks in
+            <code>skills/*.md</code>. The best-matching skill is selected automatically
+            when a task starts; it guides the plan, routes tool grants to its servers,
+            and feeds the reviewer/verifier checklists.</div>
+          <div id="skills-list" class="skills-list"></div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <audio id="tts-out" autoplay playsinline></audio>
   <script src="/static/app.js"></script>
 </body>
 </html>

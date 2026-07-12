@@ -32,6 +32,21 @@ def _sanitize(name: str) -> str:
     return _SAFE.sub("_", name)
 
 
+def _join_blocks(parts: list[str]) -> str:
+    """Join multi-block text results. FastMCP servers emit one block per list
+    element; when every block is JSON, join them as a real JSON array so the
+    result parses (for the LLM and for MCP-app bridge consumers)."""
+    if len(parts) > 1:
+        try:
+            for p in parts:
+                json.loads(p)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        else:
+            return "[" + ",".join(parts) + "]"
+    return "\n".join(parts).strip()
+
+
 @dataclass
 class MCPServerConfig:
     name: str
@@ -62,6 +77,7 @@ class MCPConnection:
         self.config = config
         self.session: ClientSession | None = None
         self.tools: list[types.Tool] = []
+        self.resources: list[types.Resource] = []
         self.error: str | None = None
         self.connected = False
         self._ready = asyncio.Event()
@@ -100,6 +116,8 @@ class MCPConnection:
                 listed = await session.list_tools()
                 self.session = session
                 self.tools = listed.tools
+                with contextlib.suppress(Exception):  # resources are optional
+                    self.resources = (await session.list_resources()).resources
                 self.connected = True
                 self.error = None
                 self._ready.set()
@@ -233,8 +251,15 @@ class MCPManager:
     def resolve(self, api_name: str) -> tuple[str, str] | None:
         return self._route.get(api_name)
 
-    async def call(self, api_name: str, arguments: dict[str, Any]) -> dict:
-        """Execute a tool call; returns {"ok": bool, "server", "tool", "result"}."""
+    async def call(
+        self, api_name: str, arguments: dict[str, Any],
+        max_chars: int | None = None,
+    ) -> dict:
+        """Execute a tool call; returns {"ok": bool, "server", "tool", "result"}.
+
+        `max_chars` caps the result text (default MAX_RESULT_CHARS, which
+        protects LLM context); app-bridge callers pass a larger cap.
+        """
         target = self.resolve(api_name)
         if target is None:
             return {
@@ -282,13 +307,52 @@ class MCPManager:
                 parts.append(f"[{type(block).__name__}]")
         if not parts and result.structuredContent:
             parts.append(json.dumps(result.structuredContent))
-        text = "\n".join(parts).strip() or "(empty result)"
+        text = _join_blocks(parts) or "(empty result)"
         return {
             "ok": not result.isError,
             "server": server,
             "tool": tool,
-            "result": text[:MAX_RESULT_CHARS],
+            "result": text[: max_chars or MAX_RESULT_CHARS],
         }
+
+    # -- resources / MCP apps ---------------------------------------------------
+
+    def server_names(self) -> list[str]:
+        return sorted(self.configs)
+
+    def ui_resources(self) -> list[dict]:
+        """All `ui://` resources (interactive MCP apps) across servers."""
+        out = []
+        for name, conn in self.connections.items():
+            if not conn.connected:
+                continue
+            for res in conn.resources:
+                uri = str(res.uri)
+                if uri.startswith("ui://"):
+                    out.append({
+                        "server": name,
+                        "uri": uri,
+                        "name": res.name or uri,
+                        "description": res.description or "",
+                    })
+        return out
+
+    async def read_resource(self, server: str, uri: str) -> str | None:
+        """Read one resource's text content (used to fetch ui:// app HTML)."""
+        conn = self.connections.get(server)
+        if conn is None or not conn.connected or conn.session is None:
+            return None
+        try:
+            result = await asyncio.wait_for(
+                conn.session.read_resource(uri), settings.tool_timeout_s
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        for block in result.contents:
+            text = getattr(block, "text", None)
+            if text:
+                return text
+        return None
 
     # -- persistence ----------------------------------------------------------
 
