@@ -55,7 +55,7 @@ parent.postMessage({ mcpApp: true, type: 'ready' }, '*');
 
 # Chart tokens per the validated reference palette (light / dark selected steps).
 _CHART_CSS = """
-body { margin: 0; font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+body { margin: 0; font: 15.6px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
 body, .root {
   --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
   --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,.1);
@@ -68,32 +68,32 @@ body[data-theme="dark"], body[data-theme="dark"] .root {
 }
 body { background: var(--surface); color: var(--ink); }
 .root { padding: 14px 16px; }
-h1 { font-size: 14px; font-weight: 600; margin: 0 0 2px; }
-.sub { color: var(--ink-2); font-size: 12px; margin-bottom: 10px; }
+h1 { font-size: 16.8px; font-weight: 600; margin: 0 0 2px; }
+.sub { color: var(--ink-2); font-size: 14.4px; margin-bottom: 10px; }
 .bar-actions { display: flex; gap: 8px; margin-top: 10px; }
 button {
-  font: 12px system-ui, sans-serif; color: var(--ink-2); background: transparent;
+  font: 14.4px system-ui, sans-serif; color: var(--ink-2); background: transparent;
   border: 1px solid var(--border); border-radius: 7px; padding: 4px 10px; cursor: pointer;
 }
 button:hover { background: var(--hover); color: var(--ink); }
-svg text { font: 11px system-ui, sans-serif; fill: var(--muted); }
+svg text { font: 13.2px system-ui, sans-serif; fill: var(--muted); }
 svg .val { fill: var(--ink-2); font-weight: 600; }
 .tip {
   position: fixed; pointer-events: none; z-index: 5; display: none;
   background: var(--surface); color: var(--ink); border: 1px solid var(--border);
-  border-radius: 8px; padding: 6px 9px; font-size: 12px;
+  border-radius: 8px; padding: 6px 9px; font-size: 14.4px;
   box-shadow: 0 4px 14px rgba(0,0,0,.25);
 }
 .tip b { display: block; }
 table { border-collapse: collapse; width: 100%; margin-top: 10px; display: none; }
 table.show { display: table; }
 th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--grid);
-         font-variant-numeric: tabular-nums; font-size: 12px; }
+         font-variant-numeric: tabular-nums; font-size: 14.4px; }
 th { color: var(--muted); font-weight: 500; }
 .legend { display: flex; gap: 14px; margin: 8px 0 0; flex-wrap: wrap; }
-.legend span { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 12px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 14.4px; }
 .legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
-.hero { font-size: 26px; font-weight: 650; fill: var(--ink); }
+.hero { font-size: 31.2px; font-weight: 650; fill: var(--ink); }
 """
 
 CHART_HTML = """<!DOCTYPE html>
@@ -258,32 +258,32 @@ window.addEventListener('resize', () => DATA && boot(DATA));
 _EXPLORER_CSS = _CHART_CSS + """
 .top { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 .top h1 { flex: 1; }
-.crumb { color: var(--ink-2); font-size: 12px; cursor: pointer; }
+.crumb { color: var(--ink-2); font-size: 14.4px; cursor: pointer; }
 .crumb:hover { color: var(--ink); text-decoration: underline; }
 .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--grid); margin-bottom: 8px; flex-wrap: wrap; }
-.tab { padding: 6px 12px; font-size: 12.5px; color: var(--ink-2); cursor: pointer;
+.tab { padding: 6px 12px; font-size: 15px; color: var(--ink-2); cursor: pointer;
        border: none; background: none; border-bottom: 2px solid transparent; border-radius: 0; }
 .tab.on { color: var(--ink); border-bottom-color: var(--s1); font-weight: 600; }
 .row { display: flex; align-items: center; gap: 8px; padding: 8px 6px;
        border-bottom: 1px solid var(--grid); }
 .row:hover { background: var(--hover); }
 .row .txt { flex: 1; min-width: 0; }
-.row .name { font-size: 13px; font-weight: 550; color: var(--ink);
+.row .name { font-size: 15.6px; font-weight: 550; color: var(--ink);
              overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.row .meta { font-size: 11.5px; color: var(--muted); }
+.row .meta { font-size: 13.8px; color: var(--muted); }
 .row .meta b { color: var(--ink-2); font-weight: 550; }
-.chip { display: inline-block; font-size: 10.5px; padding: 1px 7px; border-radius: 999px;
+.chip { display: inline-block; font-size: 12.6px; padding: 1px 7px; border-radius: 999px;
         border: 1px solid var(--border); color: var(--ink-2); margin-left: 6px; }
 .chip.pub { color: #0ca30c; border-color: #0ca30c55; }
 .chip.draft { color: var(--s2); border-color: var(--s2); opacity: .85; }
 .iconbtn { border: 1px solid var(--border); background: none; border-radius: 7px;
-           padding: 3px 8px; font-size: 11.5px; color: var(--ink-2); cursor: pointer; white-space: nowrap; }
+           padding: 3px 8px; font-size: 13.8px; color: var(--ink-2); cursor: pointer; white-space: nowrap; }
 .iconbtn:hover { background: var(--hover); color: var(--ink); }
 .search { width: 100%; box-sizing: border-box; margin: 2px 0 6px; padding: 6px 10px;
-          font: 12.5px system-ui, sans-serif; color: var(--ink);
+          font: 15px system-ui, sans-serif; color: var(--ink);
           background: transparent; border: 1px solid var(--border); border-radius: 8px; }
-.empty, .loading { color: var(--muted); font-size: 12.5px; padding: 14px 4px; }
-.err { color: #d03b3b; font-size: 12.5px; padding: 8px 4px; }
+.empty, .loading { color: var(--muted); font-size: 15px; padding: 14px 4px; }
+.err { color: #d03b3b; font-size: 15px; padding: 8px 4px; }
 .spin { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--grid);
         border-top-color: var(--s1); border-radius: 50%; animation: sp 0.8s linear infinite;
         vertical-align: -2px; margin-right: 6px; }
@@ -304,6 +304,10 @@ EXPLORER_HTML = """<!DOCTYPE html>
 <div class="tip" id="tip"></div>
 <script>
 """ + _BRIDGE_JS + """
+const CHART_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" ' +
+  'stroke="currentColor" stroke-width="2" stroke-linecap="round" ' +
+  'style="vertical-align:-1px"><line x1="18" y1="20" x2="18" y2="10"/>' +
+  '<line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>';
 let COURSES = [], COURSE = null, OVERVIEW = null, TAB = 'modules';
 const body = document.getElementById('body');
 const head = document.getElementById('head');
@@ -444,7 +448,7 @@ function renderItem(item) {
   row.appendChild(txt);
   if (TAB === 'assignments') {
     const g = document.createElement('button');
-    g.className = 'iconbtn'; g.textContent = '📊 grades';
+    g.className = 'iconbtn'; g.innerHTML = CHART_SVG + ' grades';
     g.title = 'Show the score distribution for this assignment';
     g.addEventListener('click', (e) => { e.stopPropagation(); toggleGrades(row, item, g); });
     row.appendChild(g);
@@ -478,7 +482,7 @@ async function toggleGrades(row, item, btn) {
   try { stats = jparse(await callTool('get_assignment_scores',
     { course_id: COURSE.id, assignment_id: item.id })); }
   catch (err) { stats = { error: err.message }; }
-  btn.disabled = false; btn.textContent = '📊 grades';
+  btn.disabled = false; btn.innerHTML = CHART_SVG + ' grades';
   const mini = document.createElement('div'); mini.className = 'mini';
   if (!stats || stats.error) {
     mini.innerHTML = `<div class="err">${esc(stats && stats.error || 'No data')}</div>`;
@@ -489,7 +493,7 @@ async function toggleGrades(row, item, btn) {
     mini.appendChild(chart);
     drawHistogram(chart, stats, item);
     const cap = document.createElement('div'); cap.className = 'meta';
-    cap.style.cssText = 'font-size:11.5px;color:var(--muted);padding:2px 0 4px';
+    cap.style.cssText = 'font-size: 13.8px;color:var(--muted);padding:2px 0 4px';
     cap.textContent = `${stats.scores.length} graded · ${stats.pending} pending · ${stats.missing} not submitted · mean ${stats.mean}`;
     mini.appendChild(cap);
     const wf = document.createElement('button'); wf.className = 'iconbtn';

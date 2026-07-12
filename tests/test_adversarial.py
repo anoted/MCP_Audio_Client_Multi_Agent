@@ -8,6 +8,10 @@ attack the control points one by one:
 - a denied human-approval checkpoint must block the tool (never executed)
 - an approved checkpoint must let the call through
 - plan-pending state must block worker sub-agents
+- a plain manager message must not open a workflow (manager triages);
+  run_planner is what opens one and selects the skill
+- a worker must not receive modifying tools unless an approved plan is
+  executing
 - a write step must not close without reviewer + verifier PASS
 - the MCP-app bridge must refuse write tools
 - private names must be pseudonymized toward the LLM and restored outward
@@ -177,6 +181,10 @@ class AdversarialTests(unittest.IsolatedAsyncioTestCase):
     async def test_subagent_cannot_escape_its_grant(self):
         mcp = FakeMCP({n: "ok" for n in INVENTORY})
         session, events = self.make_session(mcp)
+        # write grants require an executing plan (approval_mode=off skips
+        # the plan_review pause)
+        session.workflow.begin("build a quiz", None)
+        session.workflow.set_plan(["build a quiz"])
         turns = [
             tool_turn("Canvas__grade_submission",
                       {"user_id": 7, "grade": "100"}),  # NOT granted
@@ -272,6 +280,67 @@ class AdversarialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(mcp.calls), 1)  # still only the module call
 
     # -- workflow enforcement -------------------------------------------------------
+
+    async def test_manager_message_does_not_open_workflow(self):
+        # The manager triages: a plain question must not start a workflow —
+        # only its run_planner call (or @planner directly) opens one.
+        mcp = FakeMCP({n: "ok" for n in INVENTORY})
+        session, _ = self.make_session(mcp)
+        self.assertEqual(session.agent, "manager")
+        with patch.object(llm, "chat_stream",
+                          scripted_llm([text_turn("You have two courses.")])):
+            session._start_response("what courses do I have?")
+            await session.response_task
+        self.assertEqual(session.workflow.stage, "idle")
+        self.assertEqual(session.workflow.task, "")
+
+    async def test_run_planner_opens_workflow_and_selects_skill(self):
+        from app.skills import registry
+        registry.load()
+        settings.approval_mode = "high"
+        mcp = FakeMCP({n: "ok" for n in INVENTORY})
+        session, _ = self.make_session(mcp)
+        turns = [
+            tool_turn("submit_plan",
+                      {"todos": ["fetch submissions", "grade each one"]}),
+            text_turn("plan submitted"),
+        ]
+        with patch.object(llm, "chat_stream", scripted_llm(turns)):
+            result = await session._run_subagent(
+                {"task": "grade the homework submissions for course 1"},
+                gen=0, role="planner",
+            )
+        self.assertEqual(session.workflow.task,
+                         "grade the homework submissions for course 1")
+        self.assertEqual(session.workflow.skill, "canvas-grading")
+        self.assertTrue(session.workflow.plan_pending)
+        self.assertIn("awaiting the user's approval", result)
+
+    async def test_write_worker_blocked_without_executing_plan(self):
+        mcp = FakeMCP({n: "ok" for n in INVENTORY})
+        session, _ = self.make_session(mcp)
+        self.assertEqual(session.workflow.stage, "idle")
+        result = await session._run_subagent(
+            {"name": "builder", "instruction": "make a quiz",
+             "tools": ["quizzes"]},  # includes create_quiz -> modify
+            gen=0, role="worker",
+        )
+        self.assertIn("run_planner", result)
+        self.assertEqual(mcp.calls, [])  # nothing executed
+
+    async def test_read_worker_allowed_without_plan(self):
+        mcp = FakeMCP({n: "[]" for n in INVENTORY})
+        session, _ = self.make_session(mcp)
+        turns = [tool_turn("Canvas__list_quizzes", {}),
+                 text_turn("two quizzes found")]
+        with patch.object(llm, "chat_stream", scripted_llm(turns)):
+            result = await session._run_subagent(
+                {"name": "lookup", "instruction": "list the quizzes",
+                 "tools": ["read"]},
+                gen=0, role="worker",
+            )
+        self.assertIn("finished", result)
+        self.assertEqual(mcp.calls[0][0], "Canvas__list_quizzes")
 
     async def test_plan_pending_blocks_workers(self):
         settings.approval_mode = "high"

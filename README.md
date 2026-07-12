@@ -29,11 +29,15 @@ Browser ──16 kHz PCM──▶ FastAPI ──▶ Parakeet ASR (NIM, gRPC)
 
 ## The workflow
 
-Tell the **manager** (the default agent) what you want. It then runs this
-pipeline — each arrow is enforced by the server, not just by prompts:
+Tell the **manager** (the default agent) what you want. It triages first:
+simple questions and quick look-ups are answered directly (at most one
+read-only worker) with no plan. A complex or state-modifying task runs this
+pipeline — each arrow is enforced by the server, not just by prompts, and
+workers only ever receive modifying tools while an approved plan is executing:
 
 ```
-task ─▶ skill selected ─▶ planner (read-only research ─▶ plan)
+complex task ─▶ manager calls run_planner ─▶ skill selected
+     ─▶ planner (read-only research ─▶ plan)
      ─▶ ⏸ HUMAN: approve plan (button, or say “approve”)
      ─▶ per step: worker sub-agent (scoped tools, server-routed)
               ├─ ⏸ HUMAN: approval checkpoint on risky tool calls
@@ -45,8 +49,8 @@ task ─▶ skill selected ─▶ planner (read-only research ─▶ plan)
 
 | Agent | Tools | Role |
 |---|---|---|
-| `@manager` | delegation only | orchestrates: plan → approval → execute → review → verify |
-| `@planner` | read-only + `submit_plan` | researches and produces the plan |
+| `@manager` | delegation only | triages; plans complex tasks → approval → execute → review → verify |
+| `@planner` | read-only + `submit_plan` | researches and produces the plan (usually invoked by the manager) |
 | `@explorer` | read-only | investigates and reports on demand |
 | `@reviewer` | read-only | quality gate — judges work products (PASS/FAIL) |
 | `@verifier` | read-only | independent inspector — re-checks actual state |

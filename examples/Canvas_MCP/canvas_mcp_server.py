@@ -96,10 +96,86 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+# --------------------------------------------------------------------------
+# Client-side rate limiting.
+#
+# Canvas meters each access token with a leaky bucket (~700 units, refilled
+# continuously; the X-Rate-Limit-Remaining header reports the level). Every
+# request costs units proportional to its server-side compute time, and each
+# *concurrent* request additionally pre-holds 50 units, so bursts and
+# parallelism drain the bucket fast — when it empties Canvas answers
+# 403 "Rate Limit Exceeded". Instead of failing, we:
+#   1. cap concurrency (CANVAS_MAX_CONCURRENT, default 3),
+#   2. space request starts (CANVAS_MIN_INTERVAL_MS, default 200 ms),
+#   3. ease off proactively when the bucket runs low (< ~150 units),
+#   4. retry rate-limited responses with exponential backoff + jitter
+#      (CANVAS_RATE_RETRIES, default 5), honoring Retry-After.
+# --------------------------------------------------------------------------
+
+import asyncio
+import random
+import sys
+import time
+
+RATE_MAX_CONCURRENT = int(os.environ.get("CANVAS_MAX_CONCURRENT", "3"))
+RATE_MIN_INTERVAL_S = float(os.environ.get("CANVAS_MIN_INTERVAL_MS", "200")) / 1000
+RATE_MAX_RETRIES = int(os.environ.get("CANVAS_RATE_RETRIES", "5"))
+_LOW_BUCKET = 150.0  # start slowing down below this X-Rate-Limit-Remaining
+
+_rate_sem: asyncio.Semaphore | None = None
+_pace_lock: asyncio.Lock | None = None
+_last_start = 0.0
+
+
+def _rate_limited(resp: httpx.Response) -> bool:
+    return resp.status_code == 429 or (
+        resp.status_code == 403 and "rate limit exceeded" in resp.text.lower()
+    )
+
+
+async def _throttled(method: str, url: str, **kwargs) -> httpx.Response:
+    """All Canvas HTTP goes through here: paced, bucket-aware, retrying."""
+    global _rate_sem, _pace_lock, _last_start
+    if _rate_sem is None:  # lazily bound to the running event loop
+        _rate_sem = asyncio.Semaphore(RATE_MAX_CONCURRENT)
+        _pace_lock = asyncio.Lock()
+    resp: httpx.Response | None = None
+    for attempt in range(RATE_MAX_RETRIES + 1):
+        async with _rate_sem:
+            async with _pace_lock:  # spread out request starts
+                wait = _last_start + RATE_MIN_INTERVAL_S - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                _last_start = time.monotonic()
+            resp = await _client().request(method, url, **kwargs)
+        if not _rate_limited(resp):
+            # Proactive brake: the emptier the bucket, the longer we pause.
+            try:
+                remaining = float(resp.headers.get("x-rate-limit-remaining", ""))
+            except ValueError:
+                remaining = _LOW_BUCKET
+            if remaining < _LOW_BUCKET:
+                brake = min(3.0, (_LOW_BUCKET - remaining) / _LOW_BUCKET * 3.0)
+                print(f"[canvas] rate bucket low ({remaining:.0f}) — easing off "
+                      f"{brake:.1f}s", file=sys.stderr)
+                await asyncio.sleep(brake)
+            return resp
+        if attempt == RATE_MAX_RETRIES:
+            break
+        try:
+            delay = float(resp.headers.get("retry-after", ""))
+        except ValueError:
+            delay = min(20.0, 2.0 ** attempt + random.random())
+        print(f"[canvas] rate limited — retry {attempt + 1}/{RATE_MAX_RETRIES} "
+              f"in {delay:.1f}s", file=sys.stderr)
+        await asyncio.sleep(delay)
+    return resp
+
+
 async def _canvas(method: str, path: str, *, params=None, body=None):
     """Single Canvas API call. `path` is relative to /api/v1."""
     base, _ = _config()
-    resp = await _client().request(
+    resp = await _throttled(
         method,
         f"{base}/api/v1{path}",
         params=params,
@@ -120,7 +196,7 @@ async def _canvas_paginated(path: str, *, params=None) -> list:
     merged = {"per_page": 100, **(params or {})}
     out: list = []
     while url:
-        resp = await _client().get(url, params=merged, headers=_headers())
+        resp = await _throttled("GET", url, params=merged, headers=_headers())
         merged = None  # params are baked into the next-page URL
         if resp.status_code >= 400:
             raise RuntimeError(f"Canvas API {resp.status_code} on GET {path}: {resp.text[:500]}")
@@ -234,7 +310,7 @@ async def _file_text(f: dict) -> str:
     url = f.get("url")
     if not url:
         return "[file has no download URL — it may be locked or hidden]"
-    resp = await _client().get(url, headers=_headers())
+    resp = await _throttled("GET", url, headers=_headers())
     if resp.status_code >= 400:
         return f"[download failed: HTTP {resp.status_code}]"
     try:
@@ -258,7 +334,7 @@ async def _attachment_text(att: dict) -> str:
     if size > MAX_ATTACHMENT_BYTES:
         return f"=== {name} ===\n[skipped: file is {size} bytes, over the {MAX_ATTACHMENT_BYTES} byte limit]"
 
-    resp = await _client().get(att["url"], headers=_headers())
+    resp = await _throttled("GET", att["url"], headers=_headers())
     if resp.status_code >= 400:
         return f"=== {name} ===\n[download failed: HTTP {resp.status_code}]"
 
@@ -1030,7 +1106,7 @@ async def upload_file(
         if "id" not in file_json:
             location = file_json.get("location")
     if location:
-        confirm = await _client().get(location, headers=_headers())
+        confirm = await _throttled("GET", location, headers=_headers())
         if confirm.status_code >= 400:
             raise RuntimeError(f"Upload confirmation failed: HTTP {confirm.status_code}")
         file_json = confirm.json()

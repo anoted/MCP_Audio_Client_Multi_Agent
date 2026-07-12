@@ -4,11 +4,14 @@ Multi-agent workflow model:
 - Workflow agents (manager, planner, explorer, reviewer, verifier) plus the
   out-of-workflow assistant. Each keeps its own chat history. Typed input can
   switch agents with a leading @mention; voice always goes to the active agent.
-- The manager orchestrates the task→review→verification pipeline: run_planner
-  produces a plan that PAUSES for human approval; workers (run_subagent) get
-  tool grants expanded by the Initiator and routed to the active skill's
-  servers; steps that modified state need reviewer + verifier PASS before
-  set_todo_status(done) is accepted (enforced here, not just prompted).
+- The manager triages: simple requests are answered directly (or with one
+  read-only worker) and never open a workflow; only its run_planner call —
+  or addressing @planner directly — starts one. The plan PAUSES for human
+  approval; workers (run_subagent) get tool grants expanded by the Initiator
+  and routed to the active skill's servers, and only receive modifying tools
+  while an approved plan is executing; steps that modified state need
+  reviewer + verifier PASS before set_todo_status(done) is accepted
+  (enforced here, not just prompted).
 - Human approval checkpoints: modifying tool calls (mode-dependent: all /
   high-risk / off) suspend on an ApprovalGate until the user approves or
   denies from the UI. Denials return a tool error, never an exception.
@@ -94,9 +97,12 @@ class VoiceSession:
         self.mcp = mcp
         self.loop = asyncio.get_running_loop()
         self.agent = DEFAULT_AGENT
+        # Conversation threads: manager/planner/explorer share "workflow"
+        # (switching between them steers one session); reviewer, verifier and
+        # assistant are independent. System prompts are applied per turn in
+        # _build_messages, never stored, so the active role always wins.
         self.histories: dict[str, list[dict]] = {
-            name: [{"role": "system", "content": profile.system_prompt}]
-            for name, profile in AGENTS.items()
+            profile.thread: [] for profile in AGENTS.values()
         }
         self.workflow = Workflow()
         self.approvals = ApprovalGate()
@@ -105,6 +111,7 @@ class VoiceSession:
         self.transcript: list[dict] = []  # replayable UI log for save/load
         self.audio_buf = bytearray()
         self.capturing = False
+        self.voice_muted = False  # TTS off; text/tools/workflow unaffected
         self.gen = 0  # bumped on every interrupt; stale audio is dropped
         self.response_task: asyncio.Task | None = None
         self.tts_stop = threading.Event()
@@ -116,6 +123,9 @@ class VoiceSession:
     @property
     def todos(self) -> list[dict]:
         return self.workflow.todos
+
+    def _thread(self, agent: str) -> list[dict]:
+        return self.histories[AGENTS[agent].thread]
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -179,7 +189,8 @@ class VoiceSession:
 
     def _speak(self, text: str) -> None:
         """Queue a short spoken sentence if a TTS stream is currently open."""
-        if self._sentence_q is not None and settings.speech_configured:
+        if (self._sentence_q is not None and settings.speech_configured
+                and not self.voice_muted):
             self._sentence_q.put_nowait(text)
 
     # -- agent switching ---------------------------------------------------------
@@ -236,6 +247,16 @@ class VoiceSession:
             if target:
                 await self.interrupt()
                 self.set_agent(target)
+        elif kind == "set_voice":
+            # Mute/unmute spoken output only — the running response, tool
+            # calls and streamed text are never touched.
+            enabled = bool(msg.get("enabled", True))
+            self.voice_muted = not enabled
+            if self.voice_muted:
+                self.tts_stop.set()  # ends the current Riva TTS stream fast
+                self.gen += 1        # in-flight audio chunks get dropped
+            self.audit.event("voice_output", enabled=enabled)
+            self.send_json({"type": "voice", "enabled": enabled})
         elif kind == "approval":
             self._on_approval(msg)
         elif kind == "plan_decision":
@@ -258,7 +279,7 @@ class VoiceSession:
             await self.interrupt()
             self.approvals.cancel_all()
             for history in self.histories.values():
-                del history[1:]
+                history.clear()
             self.workflow = Workflow()
             self.pseudo = Pseudonymizer()
             self.transcript = []
@@ -401,7 +422,7 @@ class VoiceSession:
             final = conversations.save(
                 name,
                 {
-                    "version": 2,
+                    "version": 3,  # v3: histories keyed by thread, no system msgs
                     "model": settings.llm_model,
                     "agent": self.agent,
                     "workflow": self.workflow.to_dict(),
@@ -426,15 +447,25 @@ class VoiceSession:
             return
         await self.interrupt()
         stored = data.get("histories") or {}
-        for agent_name, profile in AGENTS.items():
-            seed = [{"role": "system", "content": profile.system_prompt}]
-            history = stored.get(agent_name)
-            if isinstance(history, list) and history:
-                if history[0].get("role") == "system":
-                    history = history[1:]
-                self.histories[agent_name] = seed + history
-            else:
-                self.histories[agent_name] = seed
+        threads = {profile.thread for profile in AGENTS.values()}
+        self.histories = {t: [] for t in threads}
+        if data.get("version", 1) >= 3:
+            for thread in threads:
+                history = stored.get(thread)
+                if isinstance(history, list):
+                    self.histories[thread] = [
+                        m for m in history if m.get("role") != "system"
+                    ]
+        else:
+            # Legacy per-agent files: each agent's history lands in the
+            # thread that agent uses now (manager's wins for "workflow").
+            for agent_name in ("explorer", "planner", "manager",
+                               "reviewer", "verifier", "assistant"):
+                history = stored.get(agent_name)
+                if isinstance(history, list) and len(history) > 1:
+                    self.histories[AGENTS[agent_name].thread] = [
+                        m for m in history if m.get("role") != "system"
+                    ]
         self.workflow = Workflow()
         if data.get("workflow"):
             self.workflow.load(data["workflow"])
@@ -481,21 +512,16 @@ class VoiceSession:
             if decision is not None:
                 self._on_plan_decision({"approved": decision, "note": ""})
                 return
-        # A fresh task arriving at the manager (or planner) opens a workflow:
-        # select the skill and record the task before the LLM turn starts.
-        if self.agent in ("manager", "planner") and self.workflow.stage in (
+        # Addressing the planner directly is an explicit request to plan, so
+        # it opens a workflow. Messages to the manager do NOT: the manager
+        # triages and only opens a workflow when it decides to call
+        # run_planner (see _run_subagent), so simple questions stay planless.
+        if self.agent == "planner" and self.workflow.stage in (
             "idle", "complete",
         ):
-            skill = skill_registry.select(user_text)
-            self.workflow.begin(user_text, skill.name if skill else None)
-            self.audit.event(
-                "workflow_started",
-                task=user_text[:300],
-                skill=self.workflow.skill,
-            )
-            self.send_workflow()
+            self._begin_workflow(user_text)
         self.audit.event("user_input", agent=self.agent, text=user_text[:300])
-        self.histories[self.agent].append({"role": "user", "content": user_text})
+        self._thread(self.agent).append({"role": "user", "content": user_text})
         self.transcript.append(
             {"kind": "user", "agent": self.agent, "text": user_text}
         )
@@ -518,10 +544,19 @@ class VoiceSession:
     def _active_skill(self):
         return skill_registry.get(self.workflow.skill) if self.workflow.skill else None
 
+    def _begin_workflow(self, task: str) -> None:
+        """Open a workflow for `task`: select the skill and record it."""
+        skill = skill_registry.select(task)
+        self.workflow.begin(task, skill.name if skill else None)
+        self.audit.event(
+            "workflow_started", task=task[:300], skill=self.workflow.skill
+        )
+        self.send_workflow()
+
     async def _respond(self) -> None:
         agent = self.agent
         profile = AGENTS[agent]
-        history = self.histories[agent]
+        history = self._thread(agent)
         allowed = initiator.allowed_for(agent)  # None = unrestricted
         gen = self.gen
         self.tts_stop = threading.Event()
@@ -642,8 +677,10 @@ class VoiceSession:
             self._sentence_q = None
 
     def _build_messages(self, agent: str) -> list[dict]:
-        """Agent history plus per-turn dynamic context (tool inventory, plan)."""
-        messages = list(self.histories[agent])
+        """Active agent's system prompt + per-turn dynamic context + the
+        agent's thread. Prompts are applied here (never stored) so the shared
+        workflow thread always speaks as whichever role is active now."""
+        messages = [{"role": "system", "content": AGENTS[agent].system_prompt}]
         extra = dynamic_context(
             agent,
             self.mcp,
@@ -653,7 +690,8 @@ class VoiceSession:
             workflow_stage=self.workflow.stage,
         )
         if extra:
-            messages.insert(1, {"role": "system", "content": extra})
+            messages.append({"role": "system", "content": extra})
+        messages.extend(self._thread(agent))
         return messages
 
     # -- guarded tool execution ---------------------------------------------------
@@ -1013,6 +1051,12 @@ class VoiceSession:
                 "run sub-agents until the user approves it; tell them it is "
                 "ready instead."
             )
+        # The manager deciding to plan is what opens a workflow: record the
+        # task and select the skill before the planner researches it.
+        if role == "planner" and self.workflow.stage in ("idle", "complete"):
+            task = str(args.get("task") or "").strip()
+            if task:
+                self._begin_workflow(task)
         self._sub_seq += 1
         sub_id = f"sub-{gen}-{self._sub_seq}"
         available = {s["function"]["name"] for s in self.mcp.openai_tools()}
@@ -1020,6 +1064,27 @@ class VoiceSession:
         if isinstance(setup, str):
             return setup
         name, instruction, granted_set, unmatched, step_index = setup
+        # Structural guard: modifying tools only flow to workers while an
+        # approved plan is executing, so every write is planned, human-
+        # approved, and lands in a step the reviewer/verifier must PASS.
+        if role == "worker" and self.workflow.stage != "executing":
+            writes = sorted(
+                n for n in granted_set
+                if initiator.classes.get(n) == "modify"
+            )
+            if writes:
+                self.audit.event(
+                    "subagent_blocked", reason="write-grant-without-plan",
+                    stage=self.workflow.stage, tools=writes[:10],
+                )
+                return (
+                    "Blocked: modifying tools can only be granted while an "
+                    "approved plan is executing (workflow stage is "
+                    f"'{self.workflow.stage}'). For work that changes "
+                    "anything, call run_planner first and get the plan "
+                    "approved; for a quick look-up, grant read-only tools "
+                    "instead."
+                )
         granted = sorted(granted_set)
         specs = self.mcp.openai_tools(granted_set)
         if role == "planner":
@@ -1266,8 +1331,8 @@ class VoiceSession:
             sentence = await sentence_q.get()
             if sentence is None:
                 break
-            if stop.is_set() or failed:
-                continue
+            if stop.is_set() or failed or self.voice_muted:
+                continue  # muted: drain silently, response continues
             if not started:
                 started = True
                 self.send_state("speaking")

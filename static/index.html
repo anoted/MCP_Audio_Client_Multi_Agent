@@ -9,7 +9,7 @@
 <body>
   <header>
     <div class="brand">
-      <span class="logo">🎙️</span>
+      <span class="logo" id="logo-icon"></span>
       <div>
         <h1>Voice Workflow</h1>
         <button id="model-chip" class="model-chip" title="LLM model — click to change in Settings">…</button>
@@ -18,9 +18,9 @@
     <div class="header-right">
       <span id="status-pill" class="pill">connecting</span>
       <span id="conn-dot" class="dot off" title="WebSocket"></span>
-      <button id="theme-btn" class="ghost icon" title="Toggle light/dark mode">☀️</button>
-      <button id="conv-btn" class="ghost icon" title="Save / load conversations">💾</button>
-      <button id="settings-btn" class="ghost icon" title="Settings">⚙️</button>
+      <button id="theme-btn" class="ghost icon" title="Toggle light/dark mode"></button>
+      <button id="conv-btn" class="ghost icon" title="Save / load conversations"></button>
+      <button id="settings-btn" class="ghost icon" title="Settings"></button>
       <button id="reset-btn" class="ghost" title="Clear conversation">Reset</button>
     </div>
     <div id="conv-panel" class="popover hidden">
@@ -34,15 +34,28 @@
   </header>
 
   <main>
-    <section id="chat-wrap">
-      <div id="chat">
-        <div class="notice">
-          <b>Tell the manager what you want done</b> — it plans, waits for your
-          approval, then executes with worker agents while a reviewer and a
-          verifier check every change. Risky tool calls pause for your OK.
-          Type <b>@</b> to address a specific agent; voice always goes to the
-          active agent.
+    <section id="chat-col">
+      <div id="chat-wrap">
+        <div id="chat">
+          <div class="notice">
+            <b>Tell the manager what you want done</b> — quick questions it
+            answers directly; complex tasks get a plan that waits for your
+            approval, then worker agents execute while a reviewer and a
+            verifier check every change. Risky tool calls pause for your OK.
+            Manager, planner and explorer share one session thread — switch
+            between them to steer it. Type <b>@</b> to address an agent; voice
+            always goes to the active agent.
+          </div>
         </div>
+      </div>
+      <div id="rv-dock" class="hidden">
+        <div class="rv-head" id="rv-head">
+          <span class="rv-ico" id="rv-ico"></span>
+          <span class="rv-title">Review &amp; Verify</span>
+          <span id="rv-count" class="rv-count"></span>
+          <span class="rv-caret" id="rv-caret">▾</span>
+        </div>
+        <div id="rv-body" class="rv-body"></div>
       </div>
     </section>
 
@@ -108,7 +121,8 @@
         <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/>
       </svg>
     </button>
-    <button id="stop-btn" class="hidden" title="Stop the assistant (Esc)">⏹</button>
+    <button id="stop-btn" class="hidden" title="Stop the assistant (Esc)"></button>
+    <button id="voice-btn" title="Voice output on/off — muting never interrupts the response"></button>
     <div id="vad-meter"><div id="vad-fill"></div></div>
     <span id="active-agent" class="agent-chip" title="Active agent — click to switch">@manager</span>
     <div id="input-wrap">

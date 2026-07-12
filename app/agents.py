@@ -1,11 +1,16 @@
 """Agent roles, virtual tools, and the Initiator (tool classifier + router).
 
 Workflow agents (each keeps its own chat history in the session):
-- manager    orchestrates the task→review→verification pipeline: plans via
-             run_planner, pauses for human plan approval, executes with
-             scoped sub-agents, and closes write steps only after reviewer
-             and verifier PASS (enforced by the session, not just prompts)
-- planner    researches (read-only) and produces the plan via submit_plan
+- manager    triages first: simple requests (questions, quick look-ups) are
+             answered directly or via one read-only worker — no plan. Complex
+             or state-modifying tasks run the pipeline: run_planner, human
+             plan approval, scoped sub-agents, and write steps close only
+             after reviewer and verifier PASS (enforced by the session, not
+             just prompts). Workers only receive modifying tools while an
+             approved plan is executing.
+- planner    researches (read-only) and produces the plan via submit_plan;
+             normally invoked BY the manager (run_planner), but can also be
+             addressed directly on the shared thread
 - explorer   read-only investigation on demand
 - reviewer   quality gate: judges a step's work product (PASS/FAIL)
 - verifier   independent inspector: re-checks real state with read-only tools
@@ -143,8 +148,10 @@ RUN_PLANNER_SPEC = {
         "description": (
             "Run the Planner agent: it researches with read-only tools and "
             "saves a new to-do list, replacing any current plan. The plan then "
-            "pauses for the user's approval before execution. Use it whenever "
-            "there is no approved plan for the current task."
+            "pauses for the user's approval before execution. Call it only "
+            "for tasks complex enough to need a plan — multi-step work, or "
+            "anything that will create, change, delete, or post something. "
+            "Never plan for simple questions or single read-only look-ups."
         ),
         "parameters": {
             "type": "object",
@@ -246,6 +253,10 @@ class AgentProfile:
     system_prompt: str
     virtual_tools: tuple = field(default_factory=tuple)
     workflow: bool = True  # shown as part of the workflow pipeline in the UI
+    # Conversation thread this agent reads/writes. manager/planner/explorer
+    # share the "workflow" thread (switching between them steers one session);
+    # reviewer/verifier/assistant each keep an independent thread.
+    thread: str = "workflow"
 
     @property
     def virtual_tool_names(self) -> set[str]:
@@ -255,16 +266,23 @@ class AgentProfile:
 AGENTS: dict[str, AgentProfile] = {
     "manager": AgentProfile(
         name="manager",
-        description="Orchestrates: plan → approval → execute → review → verify.",
+        description="Triages; plans complex tasks → approval → execute → review → verify.",
         system_prompt=(
             "You are Manager, the orchestrator of a task → review → "
             "verification workflow. You never run task tools yourself — you "
-            "plan, delegate, and enforce quality.\n"
-            "For any new task: (1) call run_planner with the complete task; "
-            "a skill playbook and server routing are attached automatically. "
-            "(2) The plan pauses for the user's approval — while pending, do "
-            "not run sub-agents; tell the user in one sentence that the plan "
-            "is ready to approve. (3) Once approved, work through the steps "
+            "delegate and enforce quality.\n"
+            "TRIAGE every request first. Simple requests — questions, "
+            "conversation, or anything satisfied by a quick read-only "
+            "look-up — get NO plan: answer directly, or deploy a single "
+            "run_subagent worker with read-only grants and relay what it "
+            "finds. Only a complex task — multi-step work, or anything that "
+            "creates, changes, deletes, grades, or posts something — runs "
+            "the full pipeline:\n"
+            "(1) Call run_planner with the complete task; a skill playbook "
+            "and server routing are attached automatically. (2) The plan "
+            "pauses for the user's approval — while pending, do not run "
+            "sub-agents; tell the user in one sentence that the plan is "
+            "ready to approve. (3) Once approved, work through the steps "
             "one at a time: mark the step in_progress with set_todo_status, "
             "deploy a worker with run_subagent, then — for any step that "
             "modified something — call run_reviewer with the step summary and "
@@ -277,7 +295,9 @@ AGENTS: dict[str, AgentProfile] = {
             "category like 'modules' for focused work, combinations like "
             "['read', 'quizzes'] for look-up-and-modify) so a worker is never "
             "missing a tool mid-task. (5) Some tool calls pause for human "
-            "approval — that is normal; report the outcome either way. Keep "
+            "approval — that is normal; report the outcome either way. "
+            "Workers are only granted modifying tools while an approved plan "
+            "is executing — if anything must change, plan first. Keep "
             "the user informed with one short spoken sentence per step. "
             + _VOICE_STYLE
         ),
@@ -320,6 +340,7 @@ AGENTS: dict[str, AgentProfile] = {
     "reviewer": AgentProfile(
         name="reviewer",
         description="Quality gate: judges work products (PASS/FAIL).",
+        thread="reviewer",
         system_prompt=(
             "You are Reviewer, the quality gate of the workflow. You are "
             "given a step's intent and the worker's report, plus a review "
@@ -333,6 +354,7 @@ AGENTS: dict[str, AgentProfile] = {
     "verifier": AgentProfile(
         name="verifier",
         description="Independent state checks with read-only tools.",
+        thread="verifier",
         system_prompt=(
             "You are Verifier, an independent inspector. Never trust reports "
             "— re-check the actual state with your read-only tools (re-fetch "
@@ -346,6 +368,7 @@ AGENTS: dict[str, AgentProfile] = {
         description="General voice chat — outside the workflow.",
         system_prompt=settings.system_prompt,  # env-configurable (SYSTEM_PROMPT)
         workflow=False,
+        thread="assistant",
     ),
 }
 
@@ -460,6 +483,17 @@ def dynamic_context(
 ) -> str | None:
     """Extra system context injected per turn (not stored in history)."""
     blocks: list[str] = []
+    if AGENTS[agent].thread == "workflow":
+        others = ", ".join(
+            f"@{n}" for n, p in AGENTS.items()
+            if p.thread == "workflow" and n != agent
+        )
+        blocks.append(
+            f"This conversation thread is shared with {others}: earlier "
+            "assistant turns may have been written while acting as one of "
+            f"those roles. Right now you are @{agent} — answer strictly in "
+            "that role."
+        )
     if agent == "planner":
         blocks.append(_inventory_text(mcp, initiator))
     elif agent == "manager":
@@ -811,6 +845,7 @@ def describe_agents() -> list[dict]:
             "description": p.description,
             "access": access.get(p.name, ""),
             "workflow": p.workflow,
+            "thread": p.thread,
         }
         for p in AGENTS.values()
     ]

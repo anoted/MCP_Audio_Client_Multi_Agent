@@ -2,8 +2,10 @@
 
 The task → review → verification pipeline:
 
-    task arrives (manager)
-      └─ skill selected (skills.registry) → servers/categories routed
+    task arrives (manager triages: simple requests are answered directly
+    and never enter the pipeline; a complex or state-modifying task does)
+      └─ manager calls run_planner → workflow opens, skill selected
+         (skills.registry) → servers/categories routed
       └─ planner researches (read-only) and submits a plan
            └─ stage: plan_review — execution is BLOCKED until the human
               approves the plan (UI button or typed "approve")

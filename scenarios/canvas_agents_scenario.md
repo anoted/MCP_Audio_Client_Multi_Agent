@@ -47,7 +47,10 @@ Replace `<COURSE_ID>` with your sandbox course id (phase 1 finds it).
 
 **Expect:** the chip's context is attached to the message; the explorer's
 browsing calls appear in the Activity panel as `app_tool_call` events (all
-read-only — try nothing else: the bridge refuses write tools).
+read-only — try nothing else: the bridge refuses write tools). The manager
+**triages**: a summarize request like this is simple, so it answers directly
+(at most one read-only worker) — no plan, and the Workflow panel stays
+*idle*. Only complex or state-modifying tasks make it call `run_planner`.
 
 3. Ask for charts by voice or text:
    > `@explorer show me the grading progress donut for course <COURSE_ID>`
@@ -63,9 +66,11 @@ read-only — try nothing else: the bridge refuses write tools).
 
 **Expect:**
 
-- Workflow panel: skill chip switches to **content builder**
-  (`canvas-content-builder`), stage → *Plan*.
-- The manager calls `run_planner` (planner card, read-only grants).
+- The manager judges this complex (it creates content) and calls
+  `run_planner` (planner card, read-only grants) — that call is what opens
+  the workflow: skill chip switches to **content builder**
+  (`canvas-content-builder`), stage → *Plan*. Workers can't get write tools
+  before the plan is approved (structurally blocked).
 - The plan lands in the panel and stage flips to **Approve** — the manager
   *cannot* run workers now (structurally blocked, try telling it to).
 - No write tool has been called.
