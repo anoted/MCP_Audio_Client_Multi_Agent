@@ -13,17 +13,22 @@ Exposes tools, resources, and prompts for:
   * course files (list, upload from local disk, extract text)
   * announcements, discussions, and the student roster
 
-Transport: streamable HTTP (no auth on the MCP endpoint — bind to
-localhost only). Canvas credentials come from the environment / .env:
+Transport: stdio (default — the voice client registers the server via
+mcp_servers.json). Streamable HTTP is available by swapping the mcp.run()
+call at the bottom of this file; the HTTP endpoint has no auth, so bind it
+to localhost only. Configuration comes from the environment / .env:
 
-  CANVAS_BASE_URL   e.g. https://yourschool.instructure.com
-  CANVAS_API_TOKEN  Canvas personal access token (Account > Settings >
-                    New Access Token)
-  MCP_HOST          default 127.0.0.1
-  MCP_PORT          default 8017
+  CANVAS_BASE_URL     e.g. https://yourschool.instructure.com
+  CANVAS_API_TOKEN    Canvas personal access token (Account > Settings >
+                      New Access Token)
+  MCP_HOST/MCP_PORT   HTTP transport only (default 127.0.0.1:8017)
+  CANVAS_MCP_AUDIT    set to 0 to disable the server-side audit log
+  CANVAS_MCP_LOG_DIR  audit log directory (default: logs/ next to this file)
+
+Every tool call is appended to a JSONL audit log (arguments PII-masked), so
+the server keeps its own record independent of the host app's session log.
 
 Run:  python canvas_mcp_server.py
-MCP endpoint:  http://127.0.0.1:8017/mcp
 """
 
 from __future__ import annotations
@@ -447,6 +452,102 @@ def _slim_file(f: dict) -> dict:
         "folder_id": f.get("folder_id"),
         "updated_at": f.get("updated_at"),
     }
+
+
+# --------------------------------------------------------------------------
+# Server-side audit log — one JSONL line per tool call.
+#
+# The host app writes its own session log, but that log comes from the same
+# process it governs. This one is the independent witness on the tool side:
+# which tool ran, with which arguments (PII-masked, long values truncated),
+# whether it succeeded, and how long it took. Logs go to files only — stdout
+# carries the MCP protocol on stdio.
+# --------------------------------------------------------------------------
+
+import functools
+import re
+
+_AUDIT_ENABLED = os.environ.get("CANVAS_MCP_AUDIT", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+_AUDIT_DIR = Path(os.environ.get("CANVAS_MCP_LOG_DIR") or Path(__file__).parent / "logs")
+_AUDIT_PATH = _AUDIT_DIR / f"canvas-mcp-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.jsonl"
+
+# Same masking rules as the host's privacy filter: emails and phone numbers
+# never land in a log, whatever argument they arrive in.
+_PII_EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+_PII_PHONE = re.compile(
+    r"(?<![\d/#-])(?:\+?\d{1,3}[ .-]?)?(?:\(\d{3}\)|\d{3})[ .-]\d{3}[ .-]\d{4}(?!\d)"
+)
+
+
+def _mask(value, limit: int = 300):
+    """PII-masked, truncated copy of one tool argument for the audit log."""
+    if isinstance(value, str):
+        value = _PII_EMAIL.sub("[email]", value)
+        value = _PII_PHONE.sub("[phone]", value)
+        if len(value) > limit:
+            value = value[:limit] + f"…(+{len(value) - limit} chars)"
+        return value
+    if isinstance(value, dict):
+        return {k: _mask(v, limit) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_mask(v, limit) for v in value[:20]]
+    return value
+
+
+def _audit(entry: dict) -> None:
+    if not _AUDIT_ENABLED:
+        return
+    try:
+        _AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+        with _AUDIT_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except OSError:
+        pass  # never let logging break a tool call
+
+
+_plain_tool = mcp.tool
+
+
+def _logged_tool(*dargs, **dkwargs):
+    """Drop-in for @mcp.tool() that audits every invocation of the tool."""
+    register = _plain_tool(*dargs, **dkwargs)
+
+    def wrap(fn):
+        @functools.wraps(fn)
+        async def logged(*args, **kwargs):
+            t0 = time.monotonic()
+            entry = {
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "tool": fn.__name__,
+                "args": _mask(kwargs),
+            }
+            try:
+                result = await fn(*args, **kwargs)
+            except Exception as exc:
+                entry.update(
+                    ok=False,
+                    error=_mask(str(exc), 500),
+                    ms=round((time.monotonic() - t0) * 1000),
+                )
+                _audit(entry)
+                raise
+            entry.update(
+                ok=True,
+                ms=round((time.monotonic() - t0) * 1000),
+                result_chars=len(json.dumps(result, ensure_ascii=False, default=str))
+                if result is not None else 0,
+            )
+            _audit(entry)
+            return result
+
+        return register(logged)
+
+    return wrap
+
+
+mcp.tool = _logged_tool  # every @mcp.tool() below is audited
 
 
 # --------------------------------------------------------------------------
@@ -1584,5 +1685,9 @@ if __name__ == "__main__":
         print("WARNING: CANVAS_BASE_URL / CANVAS_API_TOKEN not set — tool calls will fail "
               "until you configure them in .env and restart.", file=sys.stderr)
     print("Canvas MCP server starting (stdio transport)", file=sys.stderr)
+    if _AUDIT_ENABLED:
+        print(f"[canvas] tool-call audit log: {_AUDIT_PATH}", file=sys.stderr)
+    else:
+        print("[canvas] tool-call audit log DISABLED (CANVAS_MCP_AUDIT=0)", file=sys.stderr)
     # mcp.run(transport="streamable-http")  # HTTP alternative: http://{MCP_HOST}:{MCP_PORT}/mcp
     mcp.run(transport="stdio")

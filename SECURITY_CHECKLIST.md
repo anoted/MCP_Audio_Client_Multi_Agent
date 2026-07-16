@@ -24,7 +24,9 @@ human decision. Work through this before using the workflow on a real course.
       execution with approval prompts → reviewer/verifier PASS → done. Confirm
       each write really landed (Canvas UI) and that denying an approval really
       prevents the API call (check `logs/session-*.jsonl`: `approval_result`
-      with `approved=false` and **no** following `tool_result` for that tool).
+      with `approved=false` and **no** following `tool_result` for that tool —
+      and no matching entry in the server-side log
+      `examples/Canvas_MCP/logs/canvas-mcp-*.jsonl`, the independent witness).
 - [ ] **Test grading end-to-end on fake students only.** `grade_submission`
       posts real grades and comments instantly. With privacy mode ON, verify
       the comment that lands in Canvas contains the real student name, not
@@ -63,9 +65,15 @@ human decision. Work through this before using the workflow on a real course.
       so watch the Activity panel for `injection_flagged` events after
       grading runs and read the flagged submission yourself.
 - [ ] Audit log ON; `logs/` is gitignored but lives in plaintext on disk —
-      clean it out when a machine is shared.
+      clean it out when a machine is shared. The same applies to the Canvas
+      MCP server's own tool-call log in `examples/Canvas_MCP/logs/`
+      (gitignored, PII-masked, still sensitive; `CANVAS_MCP_AUDIT=0` turns
+      it off).
 
 ## Known limits to keep in mind
+
+The full catalog — avoidable failures vs. those the system can only survive —
+is `FAILURE_MODES.md`. Headline limits:
 
 - Reviewer/verifier verdicts come from the same LLM: they are a strong
   cross-check, not a guarantee. The human approval checkpoints are the actual

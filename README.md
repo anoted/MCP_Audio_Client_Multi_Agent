@@ -78,10 +78,17 @@ complex task ─▶ manager calls run_planner ─▶ skill selected
 - **Audit log**: every user input, tool call/result, approval, sub-agent run,
   review/verify verdict, injection flag, and app action is written to
   `logs/session-*.jsonl` and streamed to the Activity panel. Browse files in
-  Settings → Privacy & Security.
-- **Adversarial tests**: `python -m unittest discover -s tests` runs 50
+  Settings → Privacy & Security. The Canvas MCP server additionally keeps its
+  own independent tool-call log (`examples/Canvas_MCP/logs/`, PII-masked
+  arguments) as a cross-check written by the other side of the boundary.
+- **Adversarial tests**: `python -m unittest discover -s tests` runs 74
   offline tests that attack the control points (grant escape, denied
-  approvals, plan-gate bypass, injection, privacy leaks, app-bridge writes).
+  approvals, plan-gate bypass, injection, privacy leaks, app-bridge writes)
+  and pin skill parsing + trigger scoring.
+- **Failure modes**: `FAILURE_MODES.md` catalogs how the system fails —
+  avoidable failures vs. those it can only survive (wrong user input, ASR
+  mishearing, malformed LLM output, approval timeouts) — and where each one
+  shows up in the logs.
 
 ## MCP apps (interactive visualization)
 
@@ -161,11 +168,16 @@ contexts. Run the tests with `python -m unittest discover -s tests`.
 assignments, submissions/grading, quizzes, modules, pages, files,
 announcements, plus the explorer/chart apps). `mcp_servers.json` registers it
 over stdio through the `mcpagents` conda env. Its `CANVAS_BASE_URL` /
-`CANVAS_API_TOKEN` live in `examples/Canvas_MCP/.env`.
+`CANVAS_API_TOKEN` live in `examples/Canvas_MCP/.env`. The server writes a
+JSONL audit log of every tool call (PII-masked) to
+`examples/Canvas_MCP/logs/` — env `CANVAS_MCP_AUDIT=0` disables it,
+`CANVAS_MCP_LOG_DIR` moves it.
 
 > ⚠️ **The Canvas tools operate on a live Canvas instance.** Read
-> `SECURITY_CHECKLIST.md` before running write workflows, and use
-> `scenarios/canvas_agents_scenario.md` for a guided sandbox test.
+> `SECURITY_CHECKLIST.md` before running write workflows, and use the guided
+> sandbox tests: `scenarios/canvas_agents_scenario.md` (content building),
+> `scenarios/canvas_grading_scenario.md` (grading), and
+> `scenarios/triage_eval_cases.md` (routing eval table).
 
 REST API: `GET/POST /api/mcp/servers`, `DELETE|POST /api/mcp/servers/{name}[/reconnect]`,
 `GET /api/agents`, `GET /api/skills`, `GET /api/apps`, `GET /api/logs[/{name}]`,
@@ -190,7 +202,8 @@ static/                browser UI (echo-safe audio, workflow panel, settings
                        overlay, approval cards, MCP-app iframes)
 skills/                workflow playbooks (Canvas grading, content, quiz, …)
 tests/                 offline unit + adversarial suite (unittest)
-examples/Canvas_MCP/   Canvas LMS MCP server + interactive apps
-scenarios/             guided test scenarios
+examples/Canvas_MCP/   Canvas LMS MCP server + interactive apps (own audit log in logs/)
+scenarios/             guided test scenarios + triage/skill-selection eval cases
 SECURITY_CHECKLIST.md  manual verification + hardening checklist
+FAILURE_MODES.md       failure-mode catalog: avoidable vs. survivable-only
 ```
