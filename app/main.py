@@ -108,6 +108,33 @@ async def get_apps() -> dict:
     return {"apps": apps, "resources": mcp_manager.ui_resources()}
 
 
+@app.get("/api/prompts")
+async def get_prompts() -> dict:
+    """Reusable prompt templates published by connected MCP servers."""
+    return {"prompts": mcp_manager.prompts()}
+
+
+class RenderPromptRequest(BaseModel):
+    server: str
+    name: str
+    args: dict[str, str] = Field(default_factory=dict)
+
+
+@app.post("/api/prompts/render")
+async def render_prompt(req: RenderPromptRequest) -> dict:
+    """Fill a server prompt's arguments and return the rendered text. The
+    client sends that text to the active agent as ordinary user input, so
+    triage, approval gates, and the audit log all apply unchanged."""
+    text = await mcp_manager.get_prompt(req.server, req.name, req.args)
+    if text is None:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not render prompt '{req.name}' from server "
+                   f"'{req.server}' (check required arguments and connection).",
+        )
+    return {"text": text}
+
+
 @app.get("/api/logs")
 async def get_logs() -> list[dict]:
     return audit.list_log_files()

@@ -60,6 +60,11 @@ human decision. Work through this before using the workflow on a real course.
 - [ ] Privacy-preserving processing ON if your LLM endpoint is third-party
       hosted — student names/emails then never leave the machine unmasked.
       (IDs remain; treat logs as sensitive either way.)
+- [ ] MCP **prompt templates** (Prompts panel) are server-authored text sent
+      as *your own message* — more trusted than tool results, and the
+      injection guard does not screen user input. Only use the Prompts panel
+      with servers you trust, and read the message it drops into the chat
+      before approving anything downstream.
 - [ ] Injection guard ON. Canvas submission text is untrusted student input
       that flows into the LLM — the guard flags but cannot catch everything,
       so watch the Activity panel for `injection_flagged` events after

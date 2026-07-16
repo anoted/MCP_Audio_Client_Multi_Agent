@@ -10,8 +10,9 @@ A browser voice assistant with server-side speech processing and a
   streamed sentence-by-sentence
 - **Echo-safe barge-in** — speak over the assistant to stop it; playing the
   assistant through speakers does **not** interrupt it (see Audio below)
-- **MCP tools + apps** — register MCP servers from Settings; tools are exposed
-  to the LLM, and tools that return an app payload render as **interactive
+- **MCP tools, prompts + apps** — register MCP servers from Settings; tools
+  are exposed to the LLM, server-published **prompt templates** appear in the
+  Prompts panel, and tools that return an app payload render as **interactive
   panels** (Canvas course explorer, grade charts) that can push data back into
   the workflow
 - **Workflow governance** — skill playbooks, human plan approval, per-tool
@@ -81,10 +82,14 @@ complex task ─▶ manager calls run_planner ─▶ skill selected
   Settings → Privacy & Security. The Canvas MCP server additionally keeps its
   own independent tool-call log (`examples/Canvas_MCP/logs/`, PII-masked
   arguments) as a cross-check written by the other side of the boundary.
-- **Adversarial tests**: `python -m unittest discover -s tests` runs 74
+- **MCP prompts**: prompt templates published by connected servers show up in
+  the **Prompts** panel with one input per declared argument; the rendered
+  prompt is sent to the active agent as ordinary user input, so triage, plan
+  approval, tool approvals, and the audit log all apply unchanged.
+- **Adversarial tests**: `python -m unittest discover -s tests` runs 82
   offline tests that attack the control points (grant escape, denied
   approvals, plan-gate bypass, injection, privacy leaks, app-bridge writes)
-  and pin skill parsing + trigger scoring.
+  and pin skill parsing + trigger scoring and prompt listing/rendering.
 - **Failure modes**: `FAILURE_MODES.md` catalogs how the system fails —
   avoidable failures vs. those it can only survive (wrong user input, ASR
   mishearing, malformed LLM output, approval timeouts) — and where each one
@@ -157,6 +162,9 @@ contexts. Run the tests with `python -m unittest discover -s tests`.
 - **Workflow panel** — stage bar (Plan → Approve → Execute → Done), active
   skill, plan with per-step badges (✎ modified state, R✓/R✗ review,
   V✓/V✗ verify), and the plan approval controls.
+- **Prompts panel** — server-published prompt templates; **Use** opens an
+  argument form, **Send to agent** renders the template on the server and
+  sends it as your message.
 - **Save / load** — 💾 in the header; one JSON file per conversation in
   `conversations/` (agent histories, workflow state, and the full transcript
   including approvals and apps are restored).
@@ -166,7 +174,10 @@ contexts. Run the tests with `python -m unittest discover -s tests`.
 
 `examples/Canvas_MCP/` is a self-contained Canvas LMS MCP server (~37 tools:
 assignments, submissions/grading, quizzes, modules, pages, files,
-announcements, plus the explorer/chart apps). `mcp_servers.json` registers it
+announcements, plus the explorer/chart apps, `canvas://` course resources,
+and four reusable prompts — `grade_homework`, `assess_single_submission`,
+`build_quiz`, `build_course_module` — surfaced in the client's Prompts
+panel). `mcp_servers.json` registers it
 over stdio through the `mcpagents` conda env. Its `CANVAS_BASE_URL` /
 `CANVAS_API_TOKEN` live in `examples/Canvas_MCP/.env`. The server writes a
 JSONL audit log of every tool call (PII-masked) to
@@ -180,7 +191,8 @@ JSONL audit log of every tool call (PII-masked) to
 > `scenarios/triage_eval_cases.md` (routing eval table).
 
 REST API: `GET/POST /api/mcp/servers`, `DELETE|POST /api/mcp/servers/{name}[/reconnect]`,
-`GET /api/agents`, `GET /api/skills`, `GET /api/apps`, `GET /api/logs[/{name}]`,
+`GET /api/agents`, `GET /api/skills`, `GET /api/apps`, `GET /api/prompts`,
+`POST /api/prompts/render`, `GET /api/logs[/{name}]`,
 `GET /api/config`, `PUT /api/settings`, `POST /api/model`,
 `GET/DELETE /api/conversations`.
 

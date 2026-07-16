@@ -460,6 +460,21 @@ main { flex: 1; display: flex; min-height: 0; }
                        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .app-entry .app-desc { font-size: 13px; color: var(--muted); }
 
+/* prompt argument form (opened under a Prompts-panel entry) */
+.prompt-form {
+  display: flex; flex-direction: column; gap: 6px;
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  padding: 9px 12px; background: var(--panel-2);
+}
+.prompt-form .pf-desc { font-size: 13px; color: var(--muted); }
+.prompt-form input {
+  background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  border-radius: var(--r-sm); padding: 6px 9px; font-size: 14px; font-family: inherit;
+  min-width: 0;
+}
+.prompt-form input:focus { outline: none; border-color: var(--accent); }
+.prompt-form .pf-btns { display: flex; gap: 6px; }
+
 /* activity log */
 .activity-log {
   max-height: 228px; overflow-y: auto; overflow-x: hidden;

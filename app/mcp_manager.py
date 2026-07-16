@@ -78,6 +78,7 @@ class MCPConnection:
         self.session: ClientSession | None = None
         self.tools: list[types.Tool] = []
         self.resources: list[types.Resource] = []
+        self.prompts: list[types.Prompt] = []
         self.error: str | None = None
         self.connected = False
         self._ready = asyncio.Event()
@@ -118,6 +119,8 @@ class MCPConnection:
                 self.tools = listed.tools
                 with contextlib.suppress(Exception):  # resources are optional
                     self.resources = (await session.list_resources()).resources
+                with contextlib.suppress(Exception):  # prompts are optional
+                    self.prompts = (await session.list_prompts()).prompts
                 self.connected = True
                 self.error = None
                 self._ready.set()
@@ -209,6 +212,10 @@ class MCPManager:
             "tools": [
                 {"name": t.name, "description": (t.description or "")[:200]}
                 for t in (conn.tools if conn else [])
+            ],
+            "prompts": [
+                {"name": p.name, "description": (p.description or "")[:200]}
+                for p in (conn.prompts if conn else [])
             ],
         }
 
@@ -353,6 +360,51 @@ class MCPManager:
             if text:
                 return text
         return None
+
+    # -- prompts (server-defined reusable prompt templates) ---------------------
+
+    def prompts(self) -> list[dict]:
+        """All prompts across connected servers, with their argument specs."""
+        out = []
+        for name, conn in self.connections.items():
+            if not conn.connected:
+                continue
+            for p in conn.prompts:
+                out.append({
+                    "server": name,
+                    "name": p.name,
+                    "description": p.description or "",
+                    "arguments": [
+                        {
+                            "name": a.name,
+                            "description": a.description or "",
+                            "required": bool(a.required),
+                        }
+                        for a in (p.arguments or [])
+                    ],
+                })
+        return out
+
+    async def get_prompt(
+        self, server: str, name: str, arguments: dict[str, str] | None = None
+    ) -> str | None:
+        """Render one server prompt; text of all returned messages joined."""
+        conn = self.connections.get(server)
+        if conn is None or not conn.connected or conn.session is None:
+            return None
+        try:
+            result = await asyncio.wait_for(
+                conn.session.get_prompt(name, arguments=arguments or None),
+                settings.tool_timeout_s,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        parts = []
+        for msg in result.messages:
+            text = getattr(msg.content, "text", None)
+            if text:
+                parts.append(text)
+        return "\n\n".join(parts).strip() or None
 
     # -- persistence ----------------------------------------------------------
 

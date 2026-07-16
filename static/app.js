@@ -97,6 +97,7 @@ const skillSelect = $("skill-select");
 const planApproval = $("plan-approval"), planNote = $("plan-note");
 const wfContextBar = $("wf-context-bar"), wfChipsEl = $("wf-chips");
 const appsSection = $("apps-section"), appsList = $("apps-list");
+const promptsSection = $("prompts-section"), promptsList = $("prompts-list");
 const rvDock = $("rv-dock"), rvBody = $("rv-body"), rvCount = $("rv-count");
 
 // Review & Verify dock (bottom-right of the chat column): reviewer/verifier
@@ -1063,6 +1064,101 @@ function renderApps(apps) {
 }
 
 // ---------------------------------------------------------------------------
+// Prompts panel (reusable prompt templates published by MCP servers)
+// ---------------------------------------------------------------------------
+let promptsKey = "";
+async function refreshPrompts() {
+  try {
+    const res = await fetch("/api/prompts");
+    const data = await res.json();
+    renderPrompts(data.prompts || []);
+  } catch { /* server restarting */ }
+}
+function renderPrompts(prompts) {
+  const key = JSON.stringify(prompts);
+  if (key === promptsKey) return; // don't redraw under an open argument form
+  promptsKey = key;
+  promptsSection.classList.toggle("hidden", !prompts.length);
+  promptsList.innerHTML = "";
+  for (const p of prompts) {
+    const el = document.createElement("div");
+    el.className = "app-entry prompt-entry";
+    el.innerHTML = `<span class="app-icon">${icon("message", 16)}</span><div class="app-txt">
+        <div class="app-name"></div><div class="app-desc"></div></div>
+        <button class="ghost tiny">Use</button>`;
+    el.querySelector(".app-name").textContent = p.name.replace(/_/g, " ");
+    el.querySelector(".app-desc").textContent = p.server;
+    el.title = p.description || "";
+    el.querySelector("button").addEventListener("click", () => openPromptForm(el, p));
+    promptsList.appendChild(el);
+  }
+}
+function openPromptForm(entry, p) {
+  const old = promptsList.querySelector(".prompt-form");
+  const wasOwn = old && old.previousSibling === entry;
+  if (old) old.remove();
+  if (wasOwn) return; // second click on the same entry toggles the form off
+  const form = document.createElement("form");
+  form.className = "prompt-form";
+  if (p.description) {
+    const desc = document.createElement("div");
+    desc.className = "pf-desc";
+    desc.textContent = p.description;
+    form.appendChild(desc);
+  }
+  for (const a of p.arguments || []) {
+    const input = document.createElement("input");
+    input.name = a.name;
+    input.placeholder = a.name + (a.required ? " *" : "");
+    input.title = a.description || "";
+    input.required = !!a.required;
+    input.autocomplete = "off";
+    form.appendChild(input);
+  }
+  const btns = document.createElement("div");
+  btns.className = "pf-btns";
+  btns.innerHTML = `<button type="submit" class="primary tiny">Send to agent</button>
+      <button type="button" class="ghost tiny">Cancel</button>`;
+  form.appendChild(btns);
+  const err = document.createElement("div");
+  err.className = "form-error";
+  form.appendChild(err);
+  btns.querySelector("[type=button]").addEventListener("click", () => form.remove());
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    err.textContent = "";
+    const args = {};
+    for (const input of form.querySelectorAll("input")) {
+      if (input.value.trim()) args[input.name] = input.value.trim();
+    }
+    const submit = btns.querySelector("[type=submit]");
+    submit.disabled = true;
+    try {
+      const res = await fetch("/api/prompts/render", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ server: p.server, name: p.name, args }),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        err.textContent = detail.detail || `Failed (${res.status})`;
+        return;
+      }
+      const data = await res.json();
+      stopPlayback();
+      send({ type: "text", text: data.text }); // ordinary user input: triage,
+      form.remove();                           // approvals, audit all apply
+    } catch (ex) {
+      err.textContent = ex.message;
+    } finally {
+      submit.disabled = false;
+    }
+  });
+  entry.after(form);
+  form.querySelector("input")?.focus();
+}
+
+// ---------------------------------------------------------------------------
 // Conversations (save / load)
 // ---------------------------------------------------------------------------
 convBtn.addEventListener("click", () => {
@@ -1577,6 +1673,7 @@ function renderServers(servers) {
       refreshServers();
       refreshAgents();
       refreshApps();
+      refreshPrompts();
     });
     el.querySelector(".reconnect").addEventListener("click", async () => {
       el.querySelector(".reconnect").textContent = "…";
@@ -1584,6 +1681,7 @@ function renderServers(servers) {
       refreshServers();
       refreshAgents();
       refreshApps();
+      refreshPrompts();
     });
     mcpList.appendChild(el);
   }
@@ -1620,6 +1718,7 @@ mcpForm.addEventListener("submit", async (e) => {
     refreshServers();
     refreshAgents();
     refreshApps();
+    refreshPrompts();
   }
 });
 
@@ -1630,4 +1729,7 @@ connect();
 refreshServers();
 refreshAgents();
 refreshApps();
-setInterval(() => { refreshServers(); refreshAgents(); refreshApps(); }, 10000);
+refreshPrompts();
+setInterval(() => {
+  refreshServers(); refreshAgents(); refreshApps(); refreshPrompts();
+}, 10000);
