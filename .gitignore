@@ -8,3 +8,4 @@ app_settings.json
 .venv/
 venv/
 *.wav
+.env 2

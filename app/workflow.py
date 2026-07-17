@@ -71,7 +71,7 @@ class Workflow:
     def set_plan(self, steps: list[str]) -> None:
         self.todos = [
             {"text": t, "status": "pending", "wrote": False,
-             "review": "", "verify": ""}
+             "review": "", "verify": "", "review_note": "", "verify_note": ""}
             for t in steps
         ]
         # A plan always pauses for the human unless approvals are fully off.
@@ -105,10 +105,14 @@ class Workflow:
                 idx = i
         return idx
 
-    def record_review(self, index: int, verdict: str, kind: str) -> None:
-        """kind is 'review' or 'verify'; verdict 'pass'/'fail'."""
+    def record_review(
+        self, index: int, verdict: str, kind: str, note: str = ""
+    ) -> None:
+        """kind is 'review' or 'verify'; verdict 'pass'/'fail'. `note` is the
+        short justification shown on the step's badge in the UI."""
         if 0 <= index < len(self.todos) and kind in ("review", "verify"):
             self.todos[index][kind] = verdict
+            self.todos[index][kind + "_note"] = note[:240]
 
     def completion_block(self, index: int) -> str | None:
         """Why step `index` may not be marked done yet (None = allowed).
@@ -164,6 +168,8 @@ class Workflow:
                 "wrote": bool(t.get("wrote")),
                 "review": t.get("review", ""),
                 "verify": t.get("verify", ""),
+                "review_note": str(t.get("review_note", "")),
+                "verify_note": str(t.get("verify_note", "")),
             }
             for t in todos
             if isinstance(t, dict)

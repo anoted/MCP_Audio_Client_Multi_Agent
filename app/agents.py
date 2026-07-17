@@ -444,10 +444,13 @@ def _todos_text(todos: list[dict]) -> str:
         marks = []
         if item.get("wrote"):
             marks.append("modified state")
-        if item.get("review"):
-            marks.append(f"review:{item['review']}")
-        if item.get("verify"):
-            marks.append(f"verify:{item['verify']}")
+        for kind in ("review", "verify"):
+            if item.get(kind):
+                mark = f"{kind}:{item[kind]}"
+                note = item.get(f"{kind}_note")
+                if note and item[kind] == "fail":
+                    mark += f" — {note[:100]}"
+                marks.append(mark)
         suffix = f"  ({', '.join(marks)})" if marks else ""
         lines.append(f"{i}. [{item['status']}] {item['text']}{suffix}")
     return "\n".join(lines)

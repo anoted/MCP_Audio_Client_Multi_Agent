@@ -141,6 +141,7 @@ const ICONS = {
   alert: '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
   volume: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>',
   volumeX: '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>',
+  bulb: '<path d="M9 18h6"/><path d="M10 21h4"/><path d="M15.09 14c.18-.98.65-1.74 1.41-2.5A4.65 4.65 0 0 0 18 8 6 6 0 0 0 6 8c0 1.33.47 2.48 1.5 3.5.76.76 1.23 1.52 1.41 2.5"/>',
 };
 function icon(name, size = 18) {
   return `<svg class="ic" width="${size}" height="${size}" viewBox="0 0 24 24" ` +
@@ -243,6 +244,8 @@ function handleServerEvent(msg) {
       streamingAgent = msg.agent || currentAgent;
       break;
     case "assistant_delta": appendAssistantText(msg.text); break;
+    case "assistant_reasoning": appendReasoningText(msg.text); break;
+    case "assistant_thought": demoteToThought(); break;
     case "assistant_done": finalizeAssistant(false); break;
     case "interrupted":
       stopPlayback();
@@ -254,6 +257,12 @@ function handleServerEvent(msg) {
     case "tool_result": completeToolCard(msg); break;
     case "subagent_start": addSubCard(msg); break;
     case "subagent_delta": appendSubText(msg); break;
+    case "subagent_reasoning": appendSubReasoning(msg); break;
+    case "subagent_thought": {
+      const sub = subCards.get(msg.id);
+      if (sub) { finalizeSubReasoning(sub); wrapSubThought(sub); }
+      break;
+    }
     case "subagent_tool_call": addSubToolCall(msg); break;
     case "subagent_tool_result": completeSubToolCall(msg); break;
     case "subagent_done": finishSubCard(msg); break;
@@ -296,6 +305,7 @@ function clearChat() {
   approvalCards.clear();
   appCards.clear();
   currentAssistantEl = null;
+  currentReasoningEl = null;
   dockClear();
 }
 
@@ -495,6 +505,7 @@ function newAssistantBubble(agent) {
   return el;
 }
 function appendAssistantText(text) {
+  finalizeReasoning(); // visible text means the thinking phase is over
   if (!currentAssistantEl) {
     currentAssistantEl = newAssistantBubble(streamingAgent);
     currentAssistantEl.classList.add("streaming");
@@ -503,6 +514,7 @@ function appendAssistantText(text) {
   scrollChat();
 }
 function finalizeAssistant(interrupted) {
+  finalizeReasoning();
   if (!currentAssistantEl) return;
   currentAssistantEl.classList.remove("streaming");
   if (interrupted) {
@@ -522,6 +534,108 @@ function addAssistantFull(agent, text, interrupted) {
     tag.textContent = "⏹ interrupted";
     el.appendChild(tag);
   }
+}
+
+// ---- thought segments -------------------------------------------------------
+// Intermediate agent text that preceded tool calls / sub-agents: rendered as
+// individually collapsible segments so only the final answer stays visible.
+function thoughtPreview(text) {
+  const t = (text || "").replace(/\s+/g, " ").trim();
+  return t.length > 110 ? t.slice(0, 110) + "…" : t;
+}
+function buildThought(agent, text) {
+  text = (text || "").trim();
+  if (!text) return null;
+  const det = document.createElement("details");
+  det.className = "thought";
+  det.innerHTML = `<summary>${icon("bulb", 13)}<span class="th-agent"></span>` +
+    `<span class="th-label">thought</span><span class="th-prev"></span></summary>` +
+    `<div class="th-body"></div>`;
+  det.querySelector(".th-agent").textContent = `@${agent}`;
+  det.querySelector(".th-prev").textContent = thoughtPreview(text);
+  det.querySelector(".th-body").textContent = text;
+  return det;
+}
+function demoteToThought() {
+  // The text streamed so far led into tool calls — it is reasoning, not the
+  // answer. Replace the streaming bubble with a collapsed thought segment.
+  if (!currentAssistantEl) return;
+  const body = currentAssistantEl.querySelector(".msg-body");
+  const det = buildThought(streamingAgent, body ? body.textContent : "");
+  if (det) currentAssistantEl.replaceWith(det);
+  else currentAssistantEl.remove();
+  currentAssistantEl = null;
+  scrollChat();
+}
+function buildSubThought(text) {
+  const det = document.createElement("details");
+  det.className = "sub-thought";
+  det.innerHTML = `<summary><span class="th-label">thought</span> ` +
+    `<span class="th-prev"></span></summary><div class="th-body"></div>`;
+  det.querySelector(".th-prev").textContent = thoughtPreview(text);
+  det.querySelector(".th-body").textContent = text;
+  return det;
+}
+
+// ---- live reasoning streams -------------------------------------------------
+// Model-native thinking (reasoning_content / <think> blocks) streams into a
+// collapsed segment whose preview follows the latest tokens; it is finalized
+// into a plain thought when visible text, a tool call, or the end arrives.
+function tailPreview(text) {
+  const t = (text || "").replace(/\s+/g, " ").trim();
+  return t.length > 110 ? "…" + t.slice(-110) : t;
+}
+let currentReasoningEl = null;
+function appendReasoningText(text) {
+  if (!currentReasoningEl) {
+    const det = document.createElement("details");
+    det.className = "thought streaming";
+    det.innerHTML = `<summary>${icon("bulb", 13)}<span class="th-agent"></span>` +
+      `<span class="th-label">thinking…</span><span class="th-prev"></span>` +
+      `</summary><div class="th-body"></div>`;
+    det.querySelector(".th-agent").textContent = `@${streamingAgent}`;
+    chatEl.appendChild(det);
+    currentReasoningEl = det;
+  }
+  const body = currentReasoningEl.querySelector(".th-body");
+  body.textContent += text;
+  currentReasoningEl.querySelector(".th-prev").textContent =
+    tailPreview(body.textContent);
+  scrollChat();
+}
+function finalizeReasoning() {
+  if (!currentReasoningEl) return;
+  currentReasoningEl.classList.remove("streaming");
+  currentReasoningEl.querySelector(".th-label").textContent = "thought";
+  currentReasoningEl.querySelector(".th-prev").textContent =
+    thoughtPreview(currentReasoningEl.querySelector(".th-body").textContent);
+  currentReasoningEl = null;
+}
+function appendSubReasoning(msg) {
+  const sub = subCards.get(msg.id);
+  if (!sub) return;
+  if (!sub.reasoningEl) {
+    const det = buildSubThought("");
+    det.classList.add("streaming");
+    det.querySelector(".th-label").textContent = "thinking…";
+    sub.body.appendChild(det);
+    if (sub.textEl) sub.body.appendChild(sub.textEl); // answer stays below
+    sub.reasoningEl = det;
+  }
+  const body = sub.reasoningEl.querySelector(".th-body");
+  body.textContent += msg.text;
+  sub.reasoningEl.querySelector(".th-prev").textContent =
+    tailPreview(body.textContent);
+  subScroll(sub);
+}
+function finalizeSubReasoning(sub) {
+  if (!sub || !sub.reasoningEl) return;
+  const det = sub.reasoningEl;
+  det.classList.remove("streaming");
+  det.querySelector(".th-label").textContent = "thought";
+  det.querySelector(".th-prev").textContent =
+    thoughtPreview(det.querySelector(".th-body").textContent);
+  sub.reasoningEl = null;
 }
 
 // ---- tool cards -----------------------------------------------------------
@@ -627,6 +741,7 @@ function addSubCard(msg) {
     docked,
     body: card.querySelector(".sub-body"),
     textEl: card.querySelector(".sub-text"),
+    reasoningEl: null,
     calls: new Map(),
   });
 }
@@ -637,12 +752,27 @@ function subScroll(sub) {
 function appendSubText(msg) {
   const sub = subCards.get(msg.id);
   if (!sub) return;
+  finalizeSubReasoning(sub);
+  if (!sub.textEl) {
+    sub.textEl = document.createElement("div");
+    sub.textEl.className = "sub-text";
+    sub.body.appendChild(sub.textEl);
+  }
   sub.textEl.textContent += msg.text;
   subScroll(sub);
+}
+function wrapSubThought(sub) {
+  // The current streamed segment led into a tool call: collapse it.
+  const text = sub.textEl ? sub.textEl.textContent.trim() : "";
+  if (sub.textEl) sub.textEl.remove();
+  sub.textEl = null;
+  if (text) sub.body.appendChild(buildSubThought(text));
 }
 function addSubToolCall(msg) {
   const sub = subCards.get(msg.id);
   if (!sub) return;
+  finalizeSubReasoning(sub);
+  wrapSubThought(sub);
   const det = document.createElement("details");
   det.className = "sub-tool";
   det.innerHTML = `<summary>${icon("wrench", 13)} <span class="st-name"></span>
@@ -670,21 +800,56 @@ function completeSubToolCall(msg) {
   det.querySelector(".st-result").textContent = msg.result;
   subScroll(sub);
 }
+function subVerdict(msg) {
+  if (msg.verdict) return msg.verdict;
+  if (msg.ok && /^\s*PASS\b/i.test(msg.result || "")) return "pass";
+  if (msg.ok && /^\s*FAIL\b/i.test(msg.result || "")) return "fail";
+  return "";
+}
+// Always-visible footer with the sub-agent's answer (and the reviewer/
+// verifier verdict); the thinking/tool activity stays collapsible above it.
+function attachSubResult(card, ok, result, verdict, reason) {
+  card.querySelector(".sub-result")?.remove();
+  const foot = document.createElement("div");
+  foot.className = "sub-result";
+  let text = result || "";
+  if (verdict) {
+    const chip = document.createElement("span");
+    chip.className = `verdict-chip ${verdict}`;
+    chip.textContent = verdict.toUpperCase();
+    foot.appendChild(chip);
+    text = text.replace(/^\s*(PASS|FAIL)\b[:\s—–-]*/i, "");
+    if (!text.trim() && reason) text = reason;
+  } else if (!ok) {
+    foot.classList.add("errored");
+  }
+  const div = document.createElement("div");
+  div.className = "sr-text";
+  div.textContent = text;
+  foot.appendChild(div);
+  card.appendChild(foot);
+}
 function finishSubCard(msg) {
   const sub = subCards.get(msg.id);
   if (!sub) return;
+  finalizeSubReasoning(sub);
+  // The final streamed segment is the answer — it moves to the footer.
+  if (sub.textEl) { sub.textEl.remove(); sub.textEl = null; }
+  const verdict = subVerdict(msg);
   const status = sub.card.querySelector(".sub-status");
   let label = msg.ok ? "✓ done" : "✗ failed";
-  if (msg.ok && /^\s*PASS/i.test(msg.result)) label = "✓ PASS";
-  else if (msg.ok && /^\s*FAIL/i.test(msg.result)) label = "✗ FAIL";
+  if (verdict === "pass") label = "✓ PASS";
+  else if (verdict === "fail") label = "✗ FAIL";
   status.textContent = label;
-  sub.card.classList.add(msg.ok && !/^\s*FAIL/i.test(msg.result) ? "done" : "failed");
+  sub.card.classList.add(msg.ok && verdict !== "fail" ? "done" : "failed");
   sub.card.classList.remove("open");
   sub.card.querySelector(".sub-caret").textContent = "▸";
+  attachSubResult(sub.card, msg.ok, msg.result, verdict, msg.reason);
   subScroll(sub);
 }
 function interruptSubCards() {
   for (const sub of subCards.values()) {
+    finalizeSubReasoning(sub);
     const status = sub.card.querySelector(".sub-status");
     if (status.textContent === "running…") {
       status.textContent = "⏹ interrupted";
@@ -698,8 +863,12 @@ function addSubagentFull(e) {
   card.dataset.dock = DOCK_ROLES.has(e.role) ? "1" : "";
   card.querySelector(".sub-caret").textContent = "▸";
   const body = card.querySelector(".sub-body");
-  card.querySelector(".sub-text").textContent = e.text || "";
+  card.querySelector(".sub-text").remove(); // rebuilt from events below
   for (const ev of e.events || []) {
+    if (ev.kind === "thought") {
+      body.appendChild(buildSubThought(ev.text || ""));
+      continue;
+    }
     const det = document.createElement("details");
     det.className = "sub-tool " + (ev.ok ? "done" : "failed");
     det.innerHTML = `<summary>${icon("wrench", 13)} <span class="st-name"></span>
@@ -711,10 +880,24 @@ function addSubagentFull(e) {
     det.querySelector(".st-result").textContent = ev.result;
     body.appendChild(det);
   }
+  if (e.text && e.text.trim()) {
+    // Leftover segment: old save format, or a failed/interrupted run.
+    const div = document.createElement("div");
+    div.className = "sub-text";
+    div.textContent = e.text;
+    body.appendChild(div);
+  }
+  const verdict = e.verdict || "";
   const status = card.querySelector(".sub-status");
-  status.textContent = e.status === "done" ? "✓ done" :
-    e.status === "interrupted" ? "⏹ interrupted" : "✗ failed";
-  card.classList.add(e.status === "done" ? "done" : "failed");
+  status.textContent =
+    e.status === "interrupted" ? "⏹ interrupted" :
+    e.status !== "done" ? "✗ failed" :
+    verdict === "pass" ? "✓ PASS" :
+    verdict === "fail" ? "✗ FAIL" : "✓ done";
+  card.classList.add(e.status === "done" && verdict !== "fail" ? "done" : "failed");
+  if (e.status !== "interrupted" && (e.result || verdict)) {
+    attachSubResult(card, e.status === "done", e.result || "", verdict, e.reason);
+  }
   if (card.dataset.dock) dockAppend(card);
   else chatEl.appendChild(card);
 }
@@ -887,6 +1070,10 @@ function broadcastToApps(payload) {
 function replayTranscript(events) {
   for (const e of events) {
     if (e.kind === "user") addUserMessage(e.text);
+    else if (e.kind === "assistant" && e.thought) {
+      const det = buildThought(e.agent, e.text);
+      if (det) chatEl.appendChild(det);
+    }
     else if (e.kind === "assistant") addAssistantFull(e.agent, e.text, e.interrupted);
     else if (e.kind === "tool") {
       const card = buildToolCard(e.tool || e.name, e.server, e.arguments);
@@ -953,9 +1140,11 @@ function renderTodos(todos) {
     };
     if (t.wrote) addBadge("wrote", "✎", "This step modified state");
     if (t.review) addBadge(t.review === "pass" ? "ok" : "bad",
-      `R${t.review === "pass" ? "✓" : "✗"}`, `Reviewer: ${t.review}`);
+      `R${t.review === "pass" ? "✓" : "✗"}`,
+      `Reviewer: ${t.review}${t.review_note ? " — " + t.review_note : ""}`);
     if (t.verify) addBadge(t.verify === "pass" ? "ok" : "bad",
-      `V${t.verify === "pass" ? "✓" : "✗"}`, `Verifier: ${t.verify}`);
+      `V${t.verify === "pass" ? "✓" : "✗"}`,
+      `Verifier: ${t.verify}${t.verify_note ? " — " + t.verify_note : ""}`);
     todoList.appendChild(el);
   });
 }

@@ -91,6 +91,82 @@ def _plan_phrase(text: str) -> bool | None:
     return None
 
 
+_VERDICT = re.compile(r"\s*(PASS|FAIL)\b[:\s—–-]*", re.IGNORECASE)
+
+
+def _parse_verdict(text: str) -> tuple[str | None, str]:
+    """(verdict, reason) from a reviewer/verifier report.
+
+    verdict is 'pass'/'fail', or None when the report does not start with a
+    clear PASS/FAIL (callers treat that as fail). reason is the rest of the
+    verdict line — the short justification the UI surfaces next to the badge.
+    """
+    m = _VERDICT.match(text or "")
+    if not m:
+        return None, "no clear PASS/FAIL verdict — treated as FAIL"
+    rest = (text[m.end():].strip().splitlines() or [""])[0].strip()
+    return m.group(1).lower(), rest[:240]
+
+
+class TurnDeduper:
+    """Suppresses repeated identical tool calls inside one response turn.
+
+    Models sometimes emit the same call twice in one round, or re-issue a
+    read that already succeeded because they believe it failed. The same
+    (tool, arguments) pair within one round always reuses the first result;
+    a read-only call repeated in a later round returns the cached result
+    until a successful modifying call invalidates the cache (state may have
+    changed — e.g. a worker re-checking an object after its own write).
+    """
+
+    def __init__(self) -> None:
+        self._round: dict[str, tuple[bool, str]] = {}
+        self._reads: dict[str, str] = {}
+
+    @staticmethod
+    def key(name: str, arguments: dict) -> str:
+        try:
+            return f"{name}:{json.dumps(arguments, sort_keys=True)}"
+        except (TypeError, ValueError):
+            return f"{name}:unserializable"
+
+    def new_round(self) -> None:
+        self._round.clear()
+
+    def cached(self, key: str) -> str | None:
+        """Annotated result to reuse for a duplicate call, else None."""
+        if key in self._round:
+            ok, result = self._round[key]
+            if ok:
+                return (
+                    "[Duplicate call skipped: an identical call already ran "
+                    "in this response and succeeded — it did NOT fail. Its "
+                    "result is repeated below; do not call this tool again "
+                    "with the same arguments.]\n" + result
+                )
+            return (
+                "[Duplicate call skipped: an identical call already failed "
+                "in this response; the same error is repeated below. Change "
+                "the arguments or the approach instead of repeating it.]\n"
+                + result
+            )
+        if key in self._reads:
+            return (
+                "[Duplicate call skipped: this exact read already ran "
+                "earlier in this response and succeeded; its result is "
+                "repeated below. Nothing has changed it since.]\n"
+                + self._reads[key]
+            )
+        return None
+
+    def record(self, key: str, result: str, access: str | None, ok: bool) -> None:
+        self._round[key] = (ok, result)
+        if ok and access == "read":
+            self._reads[key] = result
+        elif ok and access == "modify":
+            self._reads.clear()
+
+
 class VoiceSession:
     def __init__(self, ws: WebSocket, mcp: MCPManager):
         self.ws = ws
@@ -527,19 +603,26 @@ class VoiceSession:
         )
         self.response_task = asyncio.create_task(self._respond())
 
-    def _flush_segment(self, agent: str, seg: list[str], interrupted: bool = False) -> None:
-        """Record the streamed-so-far assistant text as one transcript entry."""
+    def _flush_segment(
+        self, agent: str, seg: list[str], interrupted: bool = False,
+        thought: bool = False,
+    ) -> None:
+        """Record the streamed-so-far assistant text as one transcript entry.
+
+        `thought` marks intermediate reasoning that preceded tool calls —
+        the UI renders it as a collapsed segment, not as the answer."""
         text = "".join(seg).strip()
         seg.clear()
         if text:
-            self.transcript.append(
-                {
-                    "kind": "assistant",
-                    "agent": agent,
-                    "text": text,
-                    "interrupted": interrupted,
-                }
-            )
+            entry = {
+                "kind": "assistant",
+                "agent": agent,
+                "text": text,
+                "interrupted": interrupted,
+            }
+            if thought:
+                entry["thought"] = True
+            self.transcript.append(entry)
 
     def _active_skill(self):
         return skill_registry.get(self.workflow.skill) if self.workflow.skill else None
@@ -565,6 +648,7 @@ class VoiceSession:
         self._sentence_q = sentence_q
         tts_task = asyncio.create_task(self._tts_worker(sentence_q, gen, stop))
         partial: list[str] = []  # current unflushed transcript segment
+        deduper = TurnDeduper()  # duplicate tool calls within this turn
 
         try:
             self.send_state("thinking")
@@ -572,6 +656,8 @@ class VoiceSession:
             for round_no in range(settings.max_tool_rounds):
                 splitter = SentenceSplitter()
                 text_parts: list[str] = []
+                reasoning_parts: list[str] = []
+                round_sentences: list[str] = []  # spoken only if this round answers
                 tool_calls: list[dict] = []
                 tools = self.mcp.openai_tools(allowed) + list(profile.virtual_tools)
                 messages = self._build_messages(agent)
@@ -583,24 +669,54 @@ class VoiceSession:
                         self.send_json(
                             {"type": "assistant_delta", "text": event["text"]}
                         )
-                        for sentence in splitter.feed(event["text"]):
-                            sentence_q.put_nowait(sentence)
+                        round_sentences.extend(splitter.feed(event["text"]))
+                    elif event["type"] == "reasoning":
+                        # Model-native thinking: streamed to the UI as a
+                        # collapsible segment, never spoken, never in history.
+                        reasoning_parts.append(event["text"])
+                        self.send_json(
+                            {"type": "assistant_reasoning", "text": event["text"]}
+                        )
+                    elif event["type"] == "reasoning_retro":
+                        # Orphan close tag: everything streamed so far this
+                        # round was reasoning — reclassify and keep it silent.
+                        retro = "".join(text_parts)
+                        if retro.strip():
+                            reasoning_parts.insert(0, retro)
+                            self.send_json({"type": "assistant_thought"})
+                        text_parts.clear()
+                        partial.clear()
+                        round_sentences.clear()
+                        splitter = SentenceSplitter()
                     else:
                         tool_calls = event["tool_calls"]
 
-                for sentence in splitter.flush():
-                    sentence_q.put_nowait(sentence)
+                round_sentences.extend(splitter.flush())
+                reasoning = "".join(reasoning_parts).strip()
+                if reasoning:
+                    self.transcript.append(
+                        {"kind": "assistant", "agent": agent,
+                         "text": reasoning, "thought": True}
+                    )
 
                 text = "".join(text_parts)
                 if not tool_calls:
                     history.append({"role": "assistant", "content": text})
                     self._flush_segment(agent, partial)
+                    # Only the final answer is spoken — thought rounds and
+                    # reasoning stay silent (visible in the UI instead).
+                    for sentence in round_sentences:
+                        sentence_q.put_nowait(sentence)
                     break
 
                 # Tool round: record the assistant turn, run each call (virtual
                 # tools locally, the rest via MCP), then loop so the model can
-                # use the results.
-                self._flush_segment(agent, partial)
+                # use the results. Text emitted before tool calls is a
+                # "thought" — the client demotes the streaming bubble to a
+                # collapsed segment.
+                if "".join(partial).strip():
+                    self.send_json({"type": "assistant_thought"})
+                self._flush_segment(agent, partial, thought=True)
                 history.append(
                     {
                         "role": "assistant",
@@ -618,17 +734,32 @@ class VoiceSession:
                         ],
                     }
                 )
+                deduper.new_round()
                 for i, tc in enumerate(tool_calls):
                     call_id = tc["id"] or f"call_{round_no}_{i}"
                     try:
                         arguments = json.loads(tc["arguments"] or "{}")
                     except json.JSONDecodeError:
                         arguments = {}
-                    if tc["name"] in profile.virtual_tool_names:
+                    key = TurnDeduper.key(tc["name"], arguments)
+                    cached = deduper.cached(key)
+                    if cached is not None:
+                        self.audit.event(
+                            "tool_deduped", agent=agent, tool=tc["name"]
+                        )
+                        result = cached
+                    elif tc["name"] in profile.virtual_tool_names:
                         result = await self._virtual_tool(tc["name"], arguments, gen)
+                        deduper.record(key, result, access=None, ok=True)
                     else:
-                        result = await self._mcp_tool(
+                        outcome = await self._mcp_tool(
                             agent, allowed, tc, call_id, arguments
+                        )
+                        result = outcome["result"]
+                        deduper.record(
+                            key, result,
+                            access=initiator.classes.get(tc["name"]),
+                            ok=outcome["ok"],
                         )
                     history.append(
                         {
@@ -679,8 +810,12 @@ class VoiceSession:
     def _build_messages(self, agent: str) -> list[dict]:
         """Active agent's system prompt + per-turn dynamic context + the
         agent's thread. Prompts are applied here (never stored) so the shared
-        workflow thread always speaks as whichever role is active now."""
-        messages = [{"role": "system", "content": AGENTS[agent].system_prompt}]
+        workflow thread always speaks as whichever role is active now.
+
+        Everything is merged into ONE system message at position 0: strict
+        OpenAI-compatible endpoints (llama.cpp, LM Studio, …) reject any
+        request where a system message is not the very first message."""
+        system = AGENTS[agent].system_prompt
         extra = dynamic_context(
             agent,
             self.mcp,
@@ -690,9 +825,8 @@ class VoiceSession:
             workflow_stage=self.workflow.stage,
         )
         if extra:
-            messages.append({"role": "system", "content": extra})
-        messages.extend(self._thread(agent))
-        return messages
+            system = f"{system}\n\n{extra}"
+        return [{"role": "system", "content": system}, *self._thread(agent)]
 
     # -- guarded tool execution ---------------------------------------------------
 
@@ -849,7 +983,9 @@ class VoiceSession:
     async def _mcp_tool(
         self, agent: str, allowed: set[str] | None, tc: dict, call_id: str,
         arguments: dict,
-    ) -> str:
+    ) -> dict:
+        """Run one MCP tool call for the active agent; returns the outcome
+        dict ({'ok', 'result', 'flags', ...})."""
         target = self.mcp.resolve(tc["name"])
         entry = {
             "kind": "tool",
@@ -909,7 +1045,7 @@ class VoiceSession:
                 "flags": entry["flags"],
             }
         )
-        return outcome["result"]
+        return outcome
 
     async def _virtual_tool(self, name: str, args: dict, gen: int) -> str:
         if name == "submit_plan":
@@ -1051,6 +1187,12 @@ class VoiceSession:
                 "run sub-agents until the user approves it; tell them it is "
                 "ready instead."
             )
+        if role == "planner" and self.workflow.plan_pending:
+            return (
+                "Blocked: a plan is already awaiting the user's approval — "
+                "do not plan again. Tell the user in one sentence that the "
+                "plan is ready; they can approve it or request changes."
+            )
         # The manager deciding to plan is what opens a workflow: record the
         # task and select the skill before the planner researches it.
         if role == "planner" and self.workflow.stage in ("idle", "complete"):
@@ -1128,9 +1270,11 @@ class VoiceSession:
         ]
         final = ""
         wrote = False
+        deduper = TurnDeduper()  # duplicate tool calls within this run
         try:
             for round_no in range(settings.max_tool_rounds):
                 text_parts: list[str] = []
+                reasoning_parts: list[str] = []
                 tool_calls: list[dict] = []
                 async for event in llm.chat_stream(messages, specs or None):
                     if event["type"] == "delta":
@@ -1140,12 +1284,38 @@ class VoiceSession:
                             {"type": "subagent_delta", "id": sub_id,
                              "text": event["text"]}
                         )
+                    elif event["type"] == "reasoning":
+                        reasoning_parts.append(event["text"])
+                        self.send_json(
+                            {"type": "subagent_reasoning", "id": sub_id,
+                             "text": event["text"]}
+                        )
+                    elif event["type"] == "reasoning_retro":
+                        retro = "".join(text_parts)
+                        if retro.strip():
+                            reasoning_parts.insert(0, retro)
+                            self.send_json(
+                                {"type": "subagent_thought", "id": sub_id}
+                            )
+                        text_parts.clear()
+                        entry["text"] = ""
                     else:
                         tool_calls = event["tool_calls"]
+                reasoning = "".join(reasoning_parts).strip()
+                if reasoning:
+                    entry["events"].append({"kind": "thought", "text": reasoning})
                 text = "".join(text_parts)
                 if not tool_calls:
                     final = text
                     break
+                # Text before tool calls is a thought segment: keep it in the
+                # replayable event stream, then reset the live-text buffer so
+                # entry["text"] always holds only the current segment.
+                if text.strip():
+                    entry["events"].append(
+                        {"kind": "thought", "text": text.strip()}
+                    )
+                entry["text"] = ""
                 messages.append(
                     {
                         "role": "assistant",
@@ -1163,12 +1333,30 @@ class VoiceSession:
                         ],
                     }
                 )
+                deduper.new_round()
                 for i, tc in enumerate(tool_calls):
                     call_id = tc["id"] or f"{sub_id}_call_{round_no}_{i}"
                     try:
                         arguments = json.loads(tc["arguments"] or "{}")
                     except json.JSONDecodeError:
                         arguments = {}
+                    key = TurnDeduper.key(tc["name"], arguments)
+                    cached = deduper.cached(key)
+                    if cached is not None:
+                        # Duplicate of a call this run already made: reuse the
+                        # result, no UI card, no re-execution.
+                        self.audit.event(
+                            "tool_deduped", agent=f"{role}:{name}",
+                            tool=tc["name"],
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": cached,
+                            }
+                        )
+                        continue
                     self.send_json(
                         {
                             "type": "subagent_tool_call",
@@ -1207,8 +1395,14 @@ class VoiceSession:
                             "tool_blocked", agent=f"{role}:{name}",
                             tool=tc["name"], reason="not-granted",
                         )
+                    deduper.record(
+                        key, outcome["result"],
+                        access=initiator.classes.get(tc["name"]),
+                        ok=outcome["ok"],
+                    )
                     entry["events"].append(
                         {
+                            "kind": "tool",
                             "name": tc["name"],
                             "arguments": tc["arguments"] or "{}",
                             "ok": outcome["ok"],
@@ -1251,10 +1445,19 @@ class VoiceSession:
         final = (final or "").strip() or "(sub-agent produced no output)"
         entry["status"] = "done"
         entry["result"] = final[:MAX_SUBAGENT_REPORT]
-        self.audit.event("subagent_done", id=sub_id, role=role, wrote=wrote)
+        entry["text"] = ""  # the answer lives in result; avoid replay dupes
+        extra: dict = {}
+        if role in ("reviewer", "verifier"):
+            verdict, reason = _parse_verdict(final)
+            extra = {"verdict": verdict or "fail", "reason": reason}
+            entry.update(extra)
+        self.audit.event(
+            "subagent_done", id=sub_id, role=role, wrote=wrote,
+            **({"verdict": extra["verdict"]} if extra else {}),
+        )
         self.send_json(
             {"type": "subagent_done", "id": sub_id, "ok": True,
-             "result": entry["result"]}
+             "result": entry["result"], **extra}
         )
         return self._finish_role_run(
             role, name, final, wrote, step_index, unmatched
@@ -1283,16 +1486,16 @@ class VoiceSession:
             )
             return f"Planner finished:\n{report}\n\nCurrent plan:\n{plan}{pending}"
         if role in ("reviewer", "verifier"):
-            verdict = "fail"
-            if re.match(r"\s*PASS\b", final, re.IGNORECASE):
-                verdict = "pass"
-            elif not re.match(r"\s*FAIL\b", final, re.IGNORECASE):
+            parsed, reason = _parse_verdict(final)
+            verdict = parsed or "fail"
+            if parsed is None:
                 report = "(no clear PASS/FAIL verdict — treated as FAIL)\n" + report
             kind = "review" if role == "reviewer" else "verify"
             if step_index is not None:
-                self.workflow.record_review(step_index, verdict, kind)
+                self.workflow.record_review(step_index, verdict, kind, note=reason)
                 self.audit.event(
-                    f"{kind}_recorded", step=step_index + 1, verdict=verdict
+                    f"{kind}_recorded", step=step_index + 1, verdict=verdict,
+                    note=reason[:120],
                 )
                 self.send_todos()
             return f"{role.capitalize()} verdict for step " \
