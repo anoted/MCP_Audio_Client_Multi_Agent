@@ -49,8 +49,21 @@ human decision. Work through this before using the workflow on a real course.
 - [ ] The voice client binds to `127.0.0.1` — keep it that way unless you add
       auth; the WebSocket accepts tool-affecting messages (approvals, MCP
       registration) from anyone who can reach it.
-- [ ] If you run the Canvas MCP server over HTTP instead of stdio, bind it to
-      localhost only (it has no auth on the MCP endpoint).
+- [ ] The Canvas MCP server runs over **streamable HTTP with bearer-token
+      auth** (see `MCP_security.md`). Verify the setup once: start it without
+      `CANVAS_MCP_AUTH_TOKEN` set — it must **refuse to start**; then with the
+      token set, `curl http://127.0.0.1:8017/mcp` without the header must
+      return **401** (and the attempt must appear as `http_denied` in
+      `examples/Canvas_MCP/logs/`), while the voice client with the matching
+      `CANVAS_MCP_AUTH_TOKEN` in its `.env` connects.
+- [ ] The bearer token lives only in the two `.env` files (server + client) —
+      `mcp_servers.json` must contain the `${CANVAS_MCP_AUTH_TOKEN}`
+      placeholder, never the literal value. Rotate with `--make-token` if it
+      ever leaks (update both files, restart server, reconnect client).
+- [ ] Keep `MCP_HOST=127.0.0.1`. Exposing the endpoint beyond the machine
+      requires an HTTPS reverse proxy at minimum — and past one user/machine,
+      the OAuth 2.1 upgrade in `MCP_security.md` §2, not a shared static
+      token.
 - [ ] `LLM_API_KEY` / `NVIDIA_API_KEY` in `.env`: same care — never commit.
 
 ## Governance settings (Settings ⚙ → General / Privacy)

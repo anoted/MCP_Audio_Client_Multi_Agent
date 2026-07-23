@@ -13,22 +13,41 @@ Exposes tools, resources, and prompts for:
   * course files (list, upload from local disk, extract text)
   * announcements, discussions, and the student roster
 
-Transport: stdio (default — the voice client registers the server via
-mcp_servers.json). Streamable HTTP is available by swapping the mcp.run()
-call at the bottom of this file; the HTTP endpoint has no auth, so bind it
-to localhost only. Configuration comes from the environment / .env:
+Transport: streamable HTTP (default) — the server runs as a separate
+process and the voice client connects to http://MCP_HOST:MCP_PORT/mcp with
+a bearer token (mcp_servers.json sends it from the client's environment).
+The endpoint requires `Authorization: Bearer <CANVAS_MCP_AUTH_TOKEN>` and
+validates Host/Origin headers against a localhost allowlist (DNS-rebinding
+defense). Run with --stdio (or MCP_TRANSPORT=stdio) for the legacy stdio
+transport, which needs no HTTP auth — the pipe belongs to the spawning
+client. See MCP_security.md at the repo root for the full security model.
 
-  CANVAS_BASE_URL     e.g. https://yourschool.instructure.com
-  CANVAS_API_TOKEN    Canvas personal access token (Account > Settings >
-                      New Access Token)
-  MCP_HOST/MCP_PORT   HTTP transport only (default 127.0.0.1:8017)
-  CANVAS_MCP_AUDIT    set to 0 to disable the server-side audit log
-  CANVAS_MCP_LOG_DIR  audit log directory (default: logs/ next to this file)
+Configuration comes from the environment / .env:
+
+  CANVAS_BASE_URL             e.g. https://yourschool.instructure.com
+  CANVAS_API_TOKEN            Canvas personal access token (Account >
+                              Settings > New Access Token)
+  MCP_HOST/MCP_PORT           HTTP bind address (default 127.0.0.1:8017)
+  CANVAS_MCP_AUTH_TOKEN       bearer token HTTP clients must present
+                              (generate one: python canvas_mcp_server.py
+                              --make-token)
+  CANVAS_MCP_ALLOW_NO_AUTH    set to 1 to run HTTP without auth (localhost
+                              sandboxes only — the endpoint then hands your
+                              Canvas token's powers to anything that can
+                              reach the port)
+  CANVAS_MCP_ALLOWED_HOSTS    extra allowed Host header values (comma-sep)
+  CANVAS_MCP_ALLOWED_ORIGINS  extra allowed Origin header values (comma-sep)
+  CANVAS_MCP_AUDIT            set to 0 to disable the server-side audit log
+  CANVAS_MCP_LOG_DIR          audit log directory (default: logs/ next to
+                              this file)
 
 Every tool call is appended to a JSONL audit log (arguments PII-masked), so
 the server keeps its own record independent of the host app's session log.
+Rejected HTTP requests (bad token / Host / Origin) are logged there too.
 
-Run:  python canvas_mcp_server.py
+Run:  python canvas_mcp_server.py            (streamable HTTP + bearer auth)
+      python canvas_mcp_server.py --stdio    (stdio, for process-spawning clients)
+      python canvas_mcp_server.py --make-token   (print a fresh auth token)
 """
 
 from __future__ import annotations
@@ -1674,20 +1693,162 @@ Process:
 
 
 # --------------------------------------------------------------------------
+# Streamable HTTP hardening — bearer-token auth + DNS-rebinding defenses.
+#
+# MCP 1.x standard practice for HTTP transports (spec rev 2025-06-18): the
+# server acts as an OAuth 2.0 resource server — every request must carry
+# `Authorization: Bearer <token>`, and unauthenticated requests get 401 with
+# a WWW-Authenticate challenge. For a local single-user deployment a static
+# high-entropy token compared in constant time is the accepted profile;
+# MCP_security.md documents the upgrade path to full OAuth 2.1 (IdP-issued
+# JWTs, RFC 9728 resource metadata, RFC 8707 audience binding). Host and
+# Origin headers are checked against a localhost allowlist so a browser
+# lured to an attacker's hostname cannot be used to reach this server
+# (DNS rebinding). stdio runs bypass all of this — that transport is a
+# private pipe owned by the spawning client, not a network listener.
+# --------------------------------------------------------------------------
+
+import secrets
+
+
+def _csv_env(name: str) -> set[str]:
+    return {v.strip() for v in os.environ.get(name, "").split(",") if v.strip()}
+
+
+class _HTTPGuard:
+    """Pure ASGI middleware: Host/Origin allowlists + static bearer token."""
+
+    def __init__(self, app, token: str | None, allowed_hosts: set[str],
+                 allowed_origins: set[str]):
+        self.app = app
+        self.token = token  # None → auth explicitly disabled via env
+        self.allowed_hosts = allowed_hosts
+        self.allowed_origins = allowed_origins
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = {
+            k.decode("latin-1").lower(): v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+        }
+        if headers.get("host", "") not in self.allowed_hosts:
+            await self._deny(send, 403, "Host header not allowed", scope)
+            return
+        origin = headers.get("origin")
+        if origin and origin not in self.allowed_origins:
+            await self._deny(send, 403, "Origin not allowed", scope)
+            return
+        if self.token is not None:
+            scheme, _, credential = headers.get("authorization", "").partition(" ")
+            if scheme.lower() != "bearer" or not secrets.compare_digest(
+                credential.strip(), self.token
+            ):
+                await self._deny(
+                    send, 401, "missing or invalid bearer token", scope,
+                    extra=((b"www-authenticate", b'Bearer error="invalid_token"'),),
+                )
+                return
+        await self.app(scope, receive, send)
+
+    async def _deny(self, send, status: int, reason: str, scope, extra=()):
+        _audit({
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "event": "http_denied",
+            "status": status,
+            "reason": reason,
+            "path": scope.get("path"),
+            "client": (scope.get("client") or ("?",))[0],
+        })
+        body = json.dumps({"error": reason}).encode()
+        await send({
+            "type": "http.response.start",
+            "status": status,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+                *extra,
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+# --------------------------------------------------------------------------
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    # stdout carries MCP protocol messages over stdio — logs must go to stderr
-    # (see stdio_instruction.md).
+    parser = argparse.ArgumentParser(description="Canvas LMS MCP server")
+    parser.add_argument("--stdio", action="store_true",
+                        help="run over stdio instead of streamable HTTP")
+    parser.add_argument("--make-token", action="store_true",
+                        help="print a fresh high-entropy bearer token and exit")
+    cli = parser.parse_args()
+
+    if cli.make_token:
+        print(secrets.token_urlsafe(32))
+        sys.exit(0)
+
     if not (os.environ.get("CANVAS_BASE_URL") and os.environ.get("CANVAS_API_TOKEN")):
         print("WARNING: CANVAS_BASE_URL / CANVAS_API_TOKEN not set — tool calls will fail "
               "until you configure them in .env and restart.", file=sys.stderr)
-    print("Canvas MCP server starting (stdio transport)", file=sys.stderr)
     if _AUDIT_ENABLED:
         print(f"[canvas] tool-call audit log: {_AUDIT_PATH}", file=sys.stderr)
     else:
         print("[canvas] tool-call audit log DISABLED (CANVAS_MCP_AUDIT=0)", file=sys.stderr)
-    # mcp.run(transport="streamable-http")  # HTTP alternative: http://{MCP_HOST}:{MCP_PORT}/mcp
-    mcp.run(transport="stdio")
+
+    if cli.stdio or os.environ.get("MCP_TRANSPORT", "").strip().lower() == "stdio":
+        # stdout carries MCP protocol messages over stdio — logs must go to
+        # stderr (see stdio_instruction.md).
+        print("Canvas MCP server starting (stdio transport)", file=sys.stderr)
+        mcp.run(transport="stdio")
+        sys.exit(0)
+
+    token: str | None = os.environ.get("CANVAS_MCP_AUTH_TOKEN", "").strip() or None
+    if token is None:
+        if os.environ.get("CANVAS_MCP_ALLOW_NO_AUTH", "").strip().lower() not in (
+            "1", "true", "yes"
+        ):
+            print(
+                "ERROR: CANVAS_MCP_AUTH_TOKEN is not set — the streamable HTTP "
+                "endpoint requires a bearer token.\n"
+                "  1. python canvas_mcp_server.py --make-token\n"
+                "  2. put the value in examples/Canvas_MCP/.env  (this server)\n"
+                "  3. put the same value in the voice client's .env — its\n"
+                "     mcp_servers.json sends it as "
+                "Authorization: Bearer ${CANVAS_MCP_AUTH_TOKEN}\n"
+                "Set CANVAS_MCP_ALLOW_NO_AUTH=1 only for a throwaway localhost "
+                "sandbox.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print("WARNING: running WITHOUT authentication (CANVAS_MCP_ALLOW_NO_AUTH=1) — "
+              "anything that can reach this port can wield your Canvas token.",
+              file=sys.stderr)
+    if MCP_HOST not in ("127.0.0.1", "localhost", "::1"):
+        print(f"WARNING: binding to {MCP_HOST} exposes the endpoint beyond this "
+              "machine, and bearer tokens travel in cleartext without TLS — put "
+              "the server behind an HTTPS reverse proxy (see MCP_security.md).",
+              file=sys.stderr)
+
+    allowed_hosts = {
+        f"127.0.0.1:{MCP_PORT}",
+        f"localhost:{MCP_PORT}",
+        f"{MCP_HOST}:{MCP_PORT}",
+    } | _csv_env("CANVAS_MCP_ALLOWED_HOSTS")
+    allowed_origins = {
+        f"http://127.0.0.1:{MCP_PORT}",
+        f"http://localhost:{MCP_PORT}",
+    } | _csv_env("CANVAS_MCP_ALLOWED_ORIGINS")
+
+    import uvicorn
+
+    app = mcp.streamable_http_app()
+    app.add_middleware(_HTTPGuard, token=token, allowed_hosts=allowed_hosts,
+                       allowed_origins=allowed_origins)
+    print(f"Canvas MCP server (streamable HTTP, bearer auth "
+          f"{'ON' if token else 'OFF'}) on http://{MCP_HOST}:{MCP_PORT}/mcp",
+          file=sys.stderr)
+    uvicorn.run(app, host=MCP_HOST, port=MCP_PORT, log_level="warning")

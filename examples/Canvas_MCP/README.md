@@ -1,32 +1,52 @@
 # Canvas LMS MCP Server
 
-An MCP server (Python SDK, **streamable HTTP**, no auth on the endpoint) that puts the
-Canvas API behind tools, resources, and prompts so an LLM client (Claude Code, Claude
-Desktop, etc.) can run the day-to-day of teaching a course: set and grade homework,
-build quizzes, create pages, upload files, post announcements, and manage modules.
+An MCP server (Python SDK, **streamable HTTP with bearer-token auth**) that puts the
+Canvas API behind tools, resources, and prompts so an LLM client (the bundled voice
+client, Claude Code, Claude Desktop, etc.) can run the day-to-day of teaching a
+course: set and grade homework, build quizzes, create pages, upload files, post
+announcements, and manage modules.
 
 ## Setup
 
 1. Copy `.env.example` to `.env` and fill in:
    - `CANVAS_BASE_URL` — e.g. `https://yourschool.instructure.com`
    - `CANVAS_API_TOKEN` — Canvas → Account → Settings → **+ New Access Token**
-2. Start the server (uses the conda `py_11` environment):
+   - `CANVAS_MCP_AUTH_TOKEN` — the bearer token HTTP clients must present;
+     generate one:
+
+     ```
+     conda run -n mcpagents python canvas_mcp_server.py --make-token
+     ```
+
+2. Start the server (uses the conda `mcpagents` environment; run it as its own
+   process, separate from whatever client connects to it):
 
    ```
-   conda run -n py_11 python canvas_mcp_server.py
+   conda run --no-capture-output -n mcpagents python canvas_mcp_server.py
    ```
 
-   MCP endpoint: `http://127.0.0.1:8017/mcp`
+   MCP endpoint: `http://127.0.0.1:8017/mcp` — requests without
+   `Authorization: Bearer <CANVAS_MCP_AUTH_TOKEN>` get 401. The server refuses
+   to start over HTTP if the token is unset.
 
-3. Connect a client. For Claude Code:
+3. Connect a client with the same token:
+   - **Voice client** (this repo): `mcp_servers.json` already registers
+     `http://127.0.0.1:8017/mcp` with header
+     `Authorization: Bearer ${CANVAS_MCP_AUTH_TOKEN}` — just put the token in
+     the repo root `.env` too.
+   - **Claude Code**:
 
-   ```
-   claude mcp add --transport http canvas http://127.0.0.1:8017/mcp
-   ```
+     ```
+     claude mcp add --transport http canvas http://127.0.0.1:8017/mcp --header "Authorization: Bearer <token>"
+     ```
 
-> **Security note:** the MCP endpoint itself has no authentication, but your Canvas
-> token gives full account access. Keep `MCP_HOST=127.0.0.1` so only local clients
-> can reach it, and never commit `.env`.
+> **Security note:** your Canvas token gives full account access, so the endpoint is
+> guarded: bearer-token auth (constant-time compare, refuses to start without a
+> token), Host/Origin allowlists against DNS rebinding, localhost bind by default,
+> and rejected requests logged to `logs/`. Keep `MCP_HOST=127.0.0.1` unless you put
+> the server behind an HTTPS reverse proxy. Never commit `.env`. The repo root's
+> `MCP_security.md` documents the full model, the OAuth 2.1 upgrade path, and the
+> MCP 2.0 outlook; `stdio_instruction.md` covers the auth-free stdio mode.
 
 ## Tools (31)
 

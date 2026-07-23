@@ -1,41 +1,37 @@
 # Running the Canvas MCP Server over stdio
 
-`FastMCP` server can run in stdio form.
+The server's default transport is **streamable HTTP with bearer-token auth**
+(see `README.md`). For clients that spawn the server themselves, stdio is still
+available — no code changes needed:
 
-In `canvas_mcp_server.py`, change the entrypoint at the end of the file from:
-
-```python
-if __name__ == "__main__":
-    if not (os.environ.get("CANVAS_BASE_URL") and os.environ.get("CANVAS_API_TOKEN")):
-        print("WARNING: CANVAS_BASE_URL / CANVAS_API_TOKEN not set — tool calls will fail "
-              "until you configure them in .env and restart.")
-    print(f"Canvas MCP server (streamable HTTP, no auth) on http://{MCP_HOST}:{MCP_PORT}/mcp")
-    mcp.run(transport="streamable-http")
+```
+python canvas_mcp_server.py --stdio
 ```
 
-to:
+or set `MCP_TRANSPORT=stdio` in the environment / `.env`.
 
-```python
-if __name__ == "__main__":
-    mcp.run(transport="stdio")
-```
+Over stdio there is **no HTTP endpoint and no bearer token**: the transport is a
+private pipe between the client and the process it spawned, which is why the MCP
+spec does not apply HTTP authorization to stdio servers. Credentials
+(`CANVAS_BASE_URL`, `CANVAS_API_TOKEN`) still come from the environment or
+`.env`.
 
-Do not write regular log messages to stdout when using stdio. MCP clients use stdout
-for protocol messages, so plain `print()` output can break the MCP handshake. If you
-need startup warnings or logs, send them to stderr instead.
+Do not write regular log messages to stdout when using stdio. MCP clients use
+stdout for protocol messages, so plain `print()` output can break the MCP
+handshake. If you need startup warnings or logs, send them to stderr instead —
+everything in `canvas_mcp_server.py` already does.
 
-The existing `FastMCP(...)` settings near the top of the file, such as `host`, `port`,
-and `streamable_http_path`, are harmless but only relevant when running with the HTTP
-transport.
-
-Example MCP client configuration:
+Example MCP client configuration (process-spawning client):
 
 ```json
 {
   "mcpServers": {
     "canvas": {
       "command": "conda",
-      "args": ["run", "-n", "py_11", "python", "canvas_mcp_server.py"],
+      "args": [
+        "run", "--no-capture-output", "-n", "mcpagents",
+        "python", "canvas_mcp_server.py", "--stdio"
+      ],
       "env": {
         "CANVAS_BASE_URL": "https://yourschool.instructure.com",
         "CANVAS_API_TOKEN": "your_canvas_token_here"
@@ -45,5 +41,5 @@ Example MCP client configuration:
 }
 ```
 
-If your client launches commands from a different working directory, use the absolute
-path to `canvas_mcp_server.py` in the `args` list.
+If your client launches commands from a different working directory, use the
+absolute path to `canvas_mcp_server.py` in the `args` list.

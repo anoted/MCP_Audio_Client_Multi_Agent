@@ -9,6 +9,7 @@ safe to await from other tasks.
 import asyncio
 import contextlib
 import json
+import os
 import re
 from contextlib import AsyncExitStack
 from dataclasses import asdict, dataclass, field
@@ -27,9 +28,29 @@ CONNECT_TIMEOUT_S = 30
 
 _SAFE = re.compile(r"[^a-zA-Z0-9_-]")
 
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
 
 def _sanitize(name: str) -> str:
     return _SAFE.sub("_", name)
+
+
+def _expand_env(value: str, missing: set[str]) -> str:
+    """Replace ${VAR} references with values from the process environment.
+
+    Secrets (bearer tokens, API keys) stay out of mcp_servers.json: the
+    registry stores the placeholder and expansion happens only at connect
+    time. Unset variable names are collected in `missing` so the connection
+    can fail closed with a clear message instead of sending an empty secret.
+    """
+    def sub(match: re.Match) -> str:
+        val = os.environ.get(match.group(1))
+        if val is None:
+            missing.add(match.group(1))
+            return ""
+        return val
+
+    return _ENV_REF.sub(sub, value)
 
 
 def _join_blocks(parts: list[str]) -> str:
@@ -96,21 +117,33 @@ class MCPConnection:
     async def _run(self) -> None:
         cfg = self.config
         try:
+            missing: set[str] = set()
+            url = _expand_env(cfg.url, missing)
+            headers = {
+                k: _expand_env(v, missing) for k, v in (cfg.headers or {}).items()
+            }
+            extra_env = {k: _expand_env(v, missing) for k, v in cfg.env.items()}
+            if missing:
+                raise RuntimeError(
+                    "unset environment variable(s) referenced in server config: "
+                    + ", ".join(sorted(missing))
+                    + " — set them in .env and reconnect"
+                )
             async with AsyncExitStack() as stack:
                 if cfg.transport == "stdio":
                     env = get_default_environment()
-                    env.update(cfg.env)
+                    env.update(extra_env)
                     params = StdioServerParameters(
                         command=cfg.command, args=cfg.args, env=env
                     )
                     read, write = await stack.enter_async_context(stdio_client(params))
                 elif cfg.transport == "sse":
                     read, write = await stack.enter_async_context(
-                        sse_client(cfg.url, headers=cfg.headers or None)
+                        sse_client(url, headers=headers or None)
                     )
                 else:  # streamable http
                     read, write, _ = await stack.enter_async_context(
-                        streamablehttp_client(cfg.url, headers=cfg.headers or None)
+                        streamablehttp_client(url, headers=headers or None)
                     )
                 session = await stack.enter_async_context(ClientSession(read, write))
                 await session.initialize()

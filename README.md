@@ -86,10 +86,11 @@ complex task ─▶ manager calls run_planner ─▶ skill selected
   the **Prompts** panel with one input per declared argument; the rendered
   prompt is sent to the active agent as ordinary user input, so triage, plan
   approval, tool approvals, and the audit log all apply unchanged.
-- **Adversarial tests**: `python -m unittest discover -s tests` runs 82
+- **Adversarial tests**: `python -m unittest discover -s tests` runs 109
   offline tests that attack the control points (grant escape, denied
-  approvals, plan-gate bypass, injection, privacy leaks, app-bridge writes)
-  and pin skill parsing + trigger scoring and prompt listing/rendering.
+  approvals, plan-gate bypass, injection, privacy leaks, app-bridge writes,
+  secret handling in MCP server configs) and pin skill parsing + trigger
+  scoring and prompt listing/rendering.
 - **Failure modes**: `FAILURE_MODES.md` catalogs how the system fails —
   avoidable failures vs. those it can only survive (wrong user input, ASR
   mishearing, malformed LLM output, approval timeouts) — and where each one
@@ -147,6 +148,11 @@ For a locally deployed NIM container point `RIVA_ASR_SERVER` /
 ## Run
 
 ```bash
+# 1. Canvas MCP server (separate process — streamable HTTP with bearer auth;
+#    see "Canvas MCP" below for the one-time token setup)
+conda run --no-capture-output -n mcpagents python examples/Canvas_MCP/canvas_mcp_server.py
+
+# 2. Voice client
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -177,12 +183,29 @@ assignments, submissions/grading, quizzes, modules, pages, files,
 announcements, plus the explorer/chart apps, `canvas://` course resources,
 and four reusable prompts — `grade_homework`, `assess_single_submission`,
 `build_quiz`, `build_course_module` — surfaced in the client's Prompts
-panel). `mcp_servers.json` registers it
-over stdio through the `mcpagents` conda env. Its `CANVAS_BASE_URL` /
+panel). It runs over **streamable HTTP with bearer-token auth** and is
+**started separately** from the voice client (conda `mcpagents` env):
+
+```bash
+conda run --no-capture-output -n mcpagents python examples/Canvas_MCP/canvas_mcp_server.py
+```
+
+One-time setup: generate a token with
+`conda run -n mcpagents python examples/Canvas_MCP/canvas_mcp_server.py --make-token`
+and put the value in **both** `examples/Canvas_MCP/.env` (the server checks
+it) and the root `.env` (the client sends it — `mcp_servers.json` registers
+`http://127.0.0.1:8017/mcp` with header
+`Authorization: Bearer ${CANVAS_MCP_AUTH_TOKEN}`, expanded from the
+environment at connect time so the secret never sits in the registry JSON).
+Start the Canvas server **before** the voice client, or hit **Reconnect** in
+Settings → MCP Servers after it's up. `--stdio` restores the old
+process-spawned transport. `MCP_security.md` covers the endpoint hardening
+(Host/Origin validation, fail-closed token expansion), the full OAuth 2.1
+upgrade path, and the MCP 2.0 outlook. Canvas credentials `CANVAS_BASE_URL` /
 `CANVAS_API_TOKEN` live in `examples/Canvas_MCP/.env`. The server writes a
-JSONL audit log of every tool call (PII-masked) to
-`examples/Canvas_MCP/logs/` — env `CANVAS_MCP_AUDIT=0` disables it,
-`CANVAS_MCP_LOG_DIR` moves it.
+JSONL audit log of every tool call (PII-masked, including rejected
+unauthenticated requests) to `examples/Canvas_MCP/logs/` — env
+`CANVAS_MCP_AUDIT=0` disables it, `CANVAS_MCP_LOG_DIR` moves it.
 
 > ⚠️ **The Canvas tools operate on a live Canvas instance.** Read
 > `SECURITY_CHECKLIST.md` before running write workflows, and use the guided
@@ -214,8 +237,13 @@ static/                browser UI (echo-safe audio, workflow panel, settings
                        overlay, approval cards, MCP-app iframes)
 skills/                workflow playbooks (Canvas grading, content, quiz, …)
 tests/                 offline unit + adversarial suite (unittest)
-examples/Canvas_MCP/   Canvas LMS MCP server + interactive apps (own audit log in logs/)
+examples/Canvas_MCP/   Canvas LMS MCP server (streamable HTTP + bearer auth,
+                       run separately; own audit log in logs/)
 scenarios/             guided test scenarios + triage/skill-selection eval cases
 SECURITY_CHECKLIST.md  manual verification + hardening checklist
+MCP_security.md        MCP transport security: what's implemented, OAuth 2.1
+                       standard practice, MCP 2.0 improvement path
+MCP_security_code_walkthrough.md  the security code itself, explained piece
+                       by piece (middleware, token handling, ${VAR} expansion)
 FAILURE_MODES.md       failure-mode catalog: avoidable vs. survivable-only
 ```
